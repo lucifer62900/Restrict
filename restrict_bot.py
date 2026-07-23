@@ -83,10 +83,11 @@ HELP_TXT = """<b>📚 BOT'S USAGE GUIDE</b>
 <b>🟢 1. SINGLE & BATCH DOWNLOADS</b>
 • Send a single link to process one post.
 • Send links in a "From - To" format to process multiple files at once.
-• Works for both Public and Private links.
+• Type <b>all</b> to download everything to the end of the channel!
 • <b>Examples:</b>
   ├ <code>https://t.me/xxxx/1001</code>
-  └ <code>https://t.me/c/xxxx/101 - 120</code>
+  ├ <code>https://t.me/c/xxxx/101 - 120</code>
+  └ <code>https://t.me/c/xxxx/1 - all</code>
 
 <b>👀 2. LIVE WATCHERS (AUTO-FORWARDING)</b>
 • Automatically monitor a source and forward new messages to targets.
@@ -396,7 +397,6 @@ def get_readable_time(seconds: int) -> str:
     return " ".join(time_parts)
 
 def generate_bar(percent: float, length: int = 12) -> str:
-    """Generates a status bar in the style: 〘⬤⬤⬤⬤◔○○○○○○○〙 34.3%"""
     filled_length = int(length * percent / 100)
     fraction = (percent / 100 * length) - filled_length
     has_half = fraction >= 0.5
@@ -421,12 +421,13 @@ def sanitize_filename(filename: str) -> str:
         ext = ".dat"
     return f"{name}{ext}"
 
-# --- NEW AGGRESSIVE SMART RENAME LOGIC ---
+# --- NEW SAFE AGGRESSIVE SMART RENAME LOGIC ---
 def smart_rename(filename, caption_text=""):
-    if not filename: return "Unknown_File.mp4", ""
+    filename_str = str(filename or "Unknown_File.mkv")
+    caption_str = str(caption_text or "")
     
-    name_raw = urllib.parse.unquote(filename).replace('.', ' ').replace('_', ' ').replace('+', ' ')
-    full_text = f"{name_raw} {caption_text}"
+    name_raw = urllib.parse.unquote(filename_str).replace('.', ' ').replace('_', ' ').replace('+', ' ')
+    full_text = f"{name_raw} {caption_str}"
     
     year_match = re.search(r'[\(\[](19\d{2}|20\d{2})[\)\]]', full_text)
     if not year_match:
@@ -468,7 +469,7 @@ def smart_rename(filename, caption_text=""):
 
     def clean_title_string(text):
         if not text: return ""
-        t = urllib.parse.unquote(text)
+        t = urllib.parse.unquote(str(text))
         for junk in junk_patterns:
             t = re.sub(junk, '', t, flags=re.IGNORECASE)
         t = t.replace('.', ' ').replace('_', ' ').replace('+', ' ')
@@ -485,7 +486,7 @@ def smart_rename(filename, caption_text=""):
 
     clean_name = "Unknown Title"
     
-    name_from_file = clean_title_string(filename)
+    name_from_file = clean_title_string(filename_str)
     is_file_bad = (len(name_from_file) <= 2) or \
                   bool(re.match(r'^(vid|video|document|file|telegram)_\d+$', name_from_file, re.I)) or \
                   (name_from_file.lower() in ['mp4', 'mkv', 'avi'])
@@ -494,15 +495,15 @@ def smart_rename(filename, caption_text=""):
         clean_name = name_from_file
     else:
         pure_title = ""
-        if caption_text:
-            match = re.search(r'(?:Title|Movie|Name)[^\n:]*:\s*([^\n]+)', caption_text, re.IGNORECASE)
+        if caption_str:
+            match = re.search(r'(?:Title|Movie|Name)[^\n:]*:\s*([^\n]+)', caption_str, re.IGNORECASE)
             if match:
                 pure_title = match.group(1).strip()
                 
         if pure_title:
             clean_name = clean_title_string(pure_title)
-        elif caption_text:
-            for line in caption_text.split('\n'):
+        elif caption_str:
+            for line in caption_str.split('\n'):
                 potential_name = clean_title_string(line)
                 if len(potential_name) > 2 and potential_name.lower() not in ['mp4', 'mkv', 'avi']:
                     clean_name = potential_name
@@ -511,10 +512,10 @@ def smart_rename(filename, caption_text=""):
     if not clean_name or clean_name.strip() == "": 
         clean_name = "Unknown Title"
 
-    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', filename, re.IGNORECASE)
+    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', filename_str, re.IGNORECASE)
     base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
     
-    is_remux = " REMUX" if re.search(r'remux', filename, re.IGNORECASE) else ""
+    is_remux = " REMUX" if re.search(r'remux', filename_str, re.IGNORECASE) else ""
     
     parts = [clean_name]
     if year != "Unknown": parts.append(f"({year})")
@@ -530,10 +531,10 @@ def smart_rename(filename, caption_text=""):
 async def check_link_restriction(user_id, link_text):
     """
     Analyzes the link to determine if the source content is restricted.
-    Handles both Post Links (t.me/c/xx/100) and Channel Links (t.me/c/xx).
     """
     clean_text = link_text.replace("https://", "").replace("http://", "").replace("t.me/", "").replace("c/", "")
     
+    # Do not split away "- all" during check! Only split if it's a number range
     if "-" in clean_text:
         clean_text = clean_text.split("-")[0].strip()
         
@@ -610,9 +611,6 @@ async def check_link_restriction(user_id, link_text):
     return is_restricted, status_msg
     
 async def split_file_python(file_path, chunk_size=2000*1024*1024):
-    """
-    Async wrapper that runs the blocking smart split function in a separate thread.
-    """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(io_executor, _split_file_smart, file_path, chunk_size)
 
@@ -787,7 +785,7 @@ def get_message_type(msg: Message):
     return None
 
 # ==============================================================================
-# --- HANDLERS (START/HELP/STATUS/CANCEL/etc.) ---
+# --- HANDLERS ---
 # ==============================================================================
 
 async def test_destination_access(client: Client, chat_id, thread_id=None):
@@ -2001,16 +1999,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             if len(parts) >= 3 and parts[1].isdigit(): 
                 filter_thread_id = int(parts[1])
 
-            last_segment = parts[-1].strip()
-            range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
-            if range_match:
-                fromID, toID = int(range_match.group(1)), int(range_match.group(2))
-            else:
-                fromID = toID = int(last_segment)
-
-            try: chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
-            except Exception: chatid_check = parts[0]
-
+            # 1. Start User Client immediately to process Infinite Mode queries
             user_data = await db.get_session(user_id)
             if not user_data:
                 await message.reply("**/login First.**")
@@ -2036,13 +2025,33 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 )
                 await acc.start()
                 is_temp_client = True
-            
-            try:
-                source_chat = await acc.get_chat(chatid_check)
-                source_title = source_chat.title or "Private Chat"
-            except: pass
 
-            # --- MEDIA GROUP AUTO-EXPAND FIX ---
+            # 2. Determine Chat ID
+            try: chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
+            except Exception: chatid_check = parts[0]
+
+            # 3. Parse Range and Handle "- ALL" logic
+            last_segment = parts[-1].strip()
+            range_match = re.search(r"(\d+)\s*-\s*([a-zA-Z0-9]+)", text)
+            
+            if range_match:
+                fromID = int(range_match.group(1))
+                end_str = range_match.group(2).lower()
+                
+                if end_str == "all":
+                    try:
+                        async for last_msg in acc.get_chat_history(chatid_check, limit=1):
+                            toID = last_msg.id
+                    except Exception as e:
+                        print(f"Failed to fetch last message for ALL: {e}")
+                        toID = fromID
+                else:
+                    try: toID = int(end_str)
+                    except: toID = fromID
+            else:
+                fromID = toID = int(last_segment)
+
+            # 4. Media Group Auto-Expand
             if fromID == toID:
                 try:
                     media_group = await acc.get_media_group(chatid_check, fromID)
@@ -2053,9 +2062,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 except Exception:
                     pass
 
-            total_count = max(1, toID - fromID + 1)
-
-            # --- SMART RESUME CHECK ---
+            # 5. Smart Resume Check
             primary_dest = targets[0]['dest_id'] if targets else "unknown_dest"
             saved_msg_id = await db.get_sync_progress(user_id, chatid_check, primary_dest)
 
@@ -2074,6 +2081,11 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 except: pass
 
             total_count = max(1, toID - fromID + 1)
+            
+            try:
+                source_chat = await acc.get_chat(chatid_check)
+                source_title = source_chat.title or "Private Chat"
+            except: pass
 
             ACTIVE_PROCESSES[user_id][task_uuid].update({"source_title": source_title, "total": total_count, "current": 0})
 
