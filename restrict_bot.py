@@ -9,6 +9,7 @@ import subprocess
 import gc
 import datetime
 import uuid
+import urllib.parse
 from pathlib import Path
 from collections import defaultdict
 import motor.motor_asyncio
@@ -179,6 +180,19 @@ class Database:
         count = await self.col.count_documents({"session": {"$ne": None}})
         return count
 
+    # --- NEW SMART RESUME PROGRESS METHODS ---
+    async def save_sync_progress(self, user_id, source_id, dest_id, msg_id):
+        query = {"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)}
+        await self.db.sync_progress.update_one(
+            query,
+            {"$set": {"last_msg_id": int(msg_id), "updated_at": datetime.datetime.now()}},
+            upsert=True
+        )
+
+    async def get_sync_progress(self, user_id, source_id, dest_id):
+        data = await self.db.sync_progress.find_one({"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)})
+        return data.get("last_msg_id", 0) if data else 0
+
     # --- WATCHER METHODS ---
     async def add_watcher(self, user_id, source_id, dest_id, source_thread=None, dest_thread=None, delay=0, is_restricted=False, source_title=None, dest_title=None, allowed_types=None):
         if allowed_types is None:
@@ -268,7 +282,6 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=50,                 
     sleep_threshold=20,
-    # max_concurrent_transmissions=10, 
     ipv6=False                    
 )
 
@@ -409,6 +422,112 @@ def sanitize_filename(filename: str) -> str:
     if not ext:
         ext = ".dat"
     return f"{name}{ext}"
+
+# --- NEW AGGRESSIVE SMART RENAME LOGIC (Ported from sync.py) ---
+def smart_rename(filename, caption_text=""):
+    if not filename: return "Unknown_File.mp4", ""
+    
+    name_raw = urllib.parse.unquote(filename).replace('.', ' ').replace('_', ' ').replace('+', ' ')
+    full_text = f"{name_raw} {caption_text}"
+    
+    year_match = re.search(r'[\(\[](19\d{2}|20\d{2})[\)\]]', full_text)
+    if not year_match:
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b(?=\s*(1080p|720p|480p|2160p|4k|bluray|webrip|brrip|hdrip|x264|hevc|aac))', full_text, re.I)
+    year = year_match.group(1) if year_match else "Unknown"
+
+    res = "SD"
+    if re.search(r'2160p|4k', full_text, re.I): res = "4K"
+    elif re.search(r'1080p', full_text, re.I): res = "1080p"
+    elif re.search(r'720p', full_text, re.I): res = "720p"
+    elif re.search(r'480p', full_text, re.I): res = "480p"
+
+    codec = "Other"
+    if re.search(r'x265|hevc', full_text, re.I): codec = "HEVC"
+    elif re.search(r'x264|avc', full_text, re.I): codec = "AVC"
+
+    langs_found = []
+    if re.search(r'hindi', full_text, re.I): langs_found.append("Hindi")
+    if re.search(r'tamil', full_text, re.I): langs_found.append("Tamil")
+    if re.search(r'telugu', full_text, re.I): langs_found.append("Telugu")
+    
+    lang = "English" 
+    if re.search(r'multi|dual', full_text, re.I) or len(langs_found) > 1: 
+        lang = "Multi Audio"
+    elif len(langs_found) == 1:
+        lang = langs_found[0]
+
+    junk_patterns = [
+        r'(?:https?:)?//\S+', r'\bwww\.\S+', r'\S*youtube\.com\S*', r'\S*youtu\.be\S*',
+        r'\b[a-zA-Z0-9-]+\.(com|net|org|in|site|cc|tk|ml|me|club|xyz|tv|one|movies|pro)\b(?:\S+)?',
+        r'🎞', r'📸', r'▬', r'🔥', r'👇', r'🔗', r':-', r'==', r'@[a-zA-Z0-9_]+', r'\|', r'~', r'⚡', r'⭐', r'✨', r'▶', r'💖',
+        r'join & share', r'join and share', r'quality movies', 
+        r'join channel', r'subscribe', r'join here', r'downloaded from', r'join now',
+        r'toonworld4all', r'mlwbd', r'vegmovies', r'hdhub4u', r'#Nexleech', r'desicinemas', r'1tamilmv', r'tamilmv', 
+        r'\btelegram\b', r'www\.1TamilMV\.one', r'%[0-9A-Fa-f]{2}', r'%',
+        r'UNRATED', r'UNRATEDXX',
+        r'\[.*?\]'
+    ]
+
+    def clean_title_string(text):
+        if not text: return ""
+        t = urllib.parse.unquote(text)
+        for junk in junk_patterns:
+            t = re.sub(junk, '', t, flags=re.IGNORECASE)
+        t = t.replace('.', ' ').replace('_', ' ').replace('+', ' ')
+        
+        split_regex = r'\(\d{4}\)|\[\d{4}\]|1080p|720p|480p|2160p|4k|bluray|webrip|hdrip|brrip|x264|x265|\|'
+        extracted = re.split(split_regex, t, flags=re.I)[0].strip()
+        
+        if year != "Unknown" and extracted.endswith(year):
+             extracted = extracted[:-4].strip()
+             
+        extracted = re.sub(r'[\(\[].*?[\)\]]', '', extracted)
+        extracted = re.sub(r'\s+', ' ', extracted).strip(' -_')
+        return extracted
+
+    clean_name = "Unknown Title"
+    
+    name_from_file = clean_title_string(filename)
+    is_file_bad = (len(name_from_file) <= 2) or \
+                  bool(re.match(r'^(vid|video|document|file|telegram)_\d+$', name_from_file, re.I)) or \
+                  (name_from_file.lower() in ['mp4', 'mkv', 'avi'])
+
+    if not is_file_bad:
+        clean_name = name_from_file
+    else:
+        pure_title = ""
+        if caption_text:
+            match = re.search(r'(?:Title|Movie|Name)[^\n:]*:\s*([^\n]+)', caption_text, re.IGNORECASE)
+            if match:
+                pure_title = match.group(1).strip()
+                
+        if pure_title:
+            clean_name = clean_title_string(pure_title)
+        elif caption_text:
+            for line in caption_text.split('\n'):
+                potential_name = clean_title_string(line)
+                if len(potential_name) > 2 and potential_name.lower() not in ['mp4', 'mkv', 'avi']:
+                    clean_name = potential_name
+                    break
+                    
+    if not clean_name or clean_name.strip() == "": 
+        clean_name = "Unknown Title"
+
+    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', filename, re.IGNORECASE)
+    base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
+    
+    is_remux = " REMUX" if re.search(r'remux', filename, re.IGNORECASE) else ""
+    
+    parts = [clean_name]
+    if year != "Unknown": parts.append(f"({year})")
+    if lang != "English": parts.append(f"[{lang}]")
+    if res != "SD": parts.append(f"[{res}{is_remux}]")
+    if codec != "Other": parts.append(f"[{codec}]")
+    
+    perfect_caption = " ".join(parts)
+    perfect_filename = perfect_caption + base_ext
+
+    return perfect_caption, perfect_filename
 
 async def check_link_restriction(user_id, link_text):
     """
@@ -2025,6 +2144,26 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             else:
                 fromID = toID = int(last_segment)
 
+            # --- SMART RESUME IMPLEMENTATION ---
+            try: chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
+            except Exception: chatid_check = parts[0]
+
+            primary_dest = targets[0]['dest_id'] if targets else "unknown_dest"
+            saved_msg_id = await db.get_sync_progress(user_id, chatid_check, primary_dest)
+
+            if saved_msg_id >= toID:
+                skip_msg = (f"⏭ **DUPLICATE SKIPPED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n✅ **Status:** Files up to ID `{toID}` are already synced.")
+                try: await client.send_message(message.chat.id, skip_msg, reply_to_message_id=message.id)
+                except: pass
+                if task_uuid in ACTIVE_PROCESSES.get(user_id, {}): del ACTIVE_PROCESSES[user_id][task_uuid]
+                return
+                
+            elif saved_msg_id >= fromID and saved_msg_id < toID:
+                fromID = saved_msg_id + 1
+                resume_msg = (f"♻️ **AUTO-RESUME ACTIVATED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n▶️ **Resuming From ID:** `{fromID}`")
+                try: await client.send_message(message.chat.id, resume_msg, reply_to_message_id=message.id)
+                except: pass
+
             total_count = max(1, toID - fromID + 1)
 
             # Session login
@@ -2056,7 +2195,6 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 is_temp_client = True
             
             try:
-                chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
                 source_chat = await acc.get_chat(chatid_check)
                 source_title = source_chat.title or "Private Chat"
             except: pass
@@ -2141,6 +2279,9 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                     else:
                         # Failed/Skipped (Wrong Topic): Skip FAST (0.05s)
                         await asyncio.sleep(0.05)
+                        
+                # Database progress save 
+                if not was_cancelled: await db.save_sync_progress(user_id, chatid_check, primary_dest, msgid)
 
                 # --- UPDATE DASHBOARD ---
                 if not is_restricted:
@@ -2248,6 +2389,20 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             if f"{m_id}:up" in PROGRESS: del PROGRESS[f"{m_id}:up"]
     except Exception: pass
 
+    # =====================================================================
+    # 🌟 1. EXTRACT METADATA & GENERATE CLEAN CAPTION IMMEDIATELY 🌟
+    # =====================================================================
+    original_filename = "unknown_file"
+    if msg.document and msg.document.file_name: original_filename = msg.document.file_name
+    elif msg.video and msg.video.file_name: original_filename = msg.video.file_name
+    elif msg.audio and msg.audio.file_name: original_filename = msg.audio.file_name
+    elif msg_type == "Photo": original_filename = f"{msgid}.jpg"
+    elif msg_type == "Voice": original_filename = f"{msgid}.ogg"
+
+    perfect_caption, perfect_filename = smart_rename(original_filename, msg.caption.html if msg.caption else "")
+    clean_caption = f"<b>{perfect_caption}</b>"
+    # =====================================================================
+
     # 1. FAST FORWARD (Copy to Multiple Targets)
     if not is_restricted and not getattr(msg, "has_protected_content", False) and not getattr(msg.chat, "has_protected_content", False):
         forward_success = False
@@ -2255,16 +2410,16 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             dest_chat_id = dest['dest_id']
             dest_thread_id = dest.get('dest_thread')
             try:
-                await client.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
+                await client.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                 forward_success = True
             except Exception:
                 try:
-                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
+                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     forward_success = True
                 except FloodWait as e:
                     if e.value > 300: raise e
                     await asyncio.sleep(e.value + 2)
-                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
+                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     forward_success = True
                 except Exception as e:
                     print(f"Task Fast-Copy blocked: {e}")
@@ -2282,14 +2437,7 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
     task_folder_path = Path(f"./downloads/{user_id}/{task_uuid}/{msgid}/")
     task_folder_path.mkdir(parents=True, exist_ok=True)
 
-    original_filename = "unknown_file"
-    if msg.document and msg.document.file_name: original_filename = msg.document.file_name
-    elif msg.video and msg.video.file_name: original_filename = msg.video.file_name
-    elif msg.audio and msg.audio.file_name: original_filename = msg.audio.file_name
-    elif msg_type == "Photo": original_filename = f"{msgid}.jpg"
-    elif msg_type == "Voice": original_filename = f"{msgid}.ogg"
-
-    safe_filename = sanitize_filename(original_filename)
+    safe_filename = sanitize_filename(perfect_filename)
     if not safe_filename.strip(): safe_filename = f"{msgid}.dat"
     file_path_to_save = task_folder_path / safe_filename
 
@@ -2324,7 +2472,6 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                     
                     if f"{status_message.id}:up" in PROGRESS: del PROGRESS[f"{status_message.id}:up"]
                     up_task = asyncio.create_task(upstatus(client, status_message, chat_for_status, index, total_count, header_text))
-                    caption = msg.caption.html if msg.caption else ""
                     
                     # Split Multi-Upload
                     async with USER_SEMAPHORES[user_id]:
@@ -2340,7 +2487,7 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                                             await client.send_document(
                                                 dest_chat_id, 
                                                 str(part), 
-                                                caption=caption, 
+                                                caption=clean_caption, 
                                                 parse_mode=enums.ParseMode.HTML, 
                                                 reply_to_message_id=dest_thread_id,
                                                 progress=progress,  # <--- ADDED
@@ -2393,8 +2540,6 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
         if f"{status_message.id}:up" in PROGRESS: del PROGRESS[f"{status_message.id}:up"]
         up_task = asyncio.create_task(upstatus(client, status_message, chat_for_status, index, total_count, header_text))
         
-        caption = msg.caption.html if msg.caption else ""
-        
         # CHANGED: Hand the upload over to the Bot to bypass User Bandwidth limits!
         uploader = client 
 
@@ -2410,12 +2555,12 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                     while retry_count < 5: # Fight through network blips!
                         if task_uuid and CANCEL_FLAGS.get(task_uuid): break
                         try:
-                            if "Document" == msg_type: await uploader.send_document(dest_chat_id, file_path, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Video" == msg_type: await uploader.send_video(dest_chat_id, file_path, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Audio" == msg_type: await uploader.send_audio(dest_chat_id, file_path, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Photo" == msg_type: await uploader.send_photo(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
-                            elif "Voice" == msg_type: await uploader.send_voice(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Animation" == msg_type: await uploader.send_animation(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
+                            if "Document" == msg_type: await uploader.send_document(dest_chat_id, file_path, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Video" == msg_type: await uploader.send_video(dest_chat_id, file_path, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Audio" == msg_type: await uploader.send_audio(dest_chat_id, file_path, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Photo" == msg_type: await uploader.send_photo(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
+                            elif "Voice" == msg_type: await uploader.send_voice(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Animation" == msg_type: await uploader.send_animation(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
                             elif "Sticker" == msg_type: await uploader.send_sticker(dest_chat_id, file_path, reply_to_message_id=dest_thread_id)
                             success_local = True
                             break 
@@ -2538,6 +2683,14 @@ async def process_watcher_message(client, message):
             # Use username if available so the Bot can access public channels it hasn't joined
             safe_source_id = message.chat.username if message.chat.username else chat_id
             
+            # Smart Rename the caption during Watcher forward too
+            original_filename = "unknown_file"
+            if message.document and message.document.file_name: original_filename = message.document.file_name
+            elif message.video and message.video.file_name: original_filename = message.video.file_name
+            
+            perfect_caption, _ = smart_rename(original_filename, message.caption.html if message.caption else "")
+            clean_caption = f"<b>{perfect_caption}</b>"
+
             for t in targets:
                 success = False
                 dest_id = t['dest_id']
@@ -2547,7 +2700,7 @@ async def process_watcher_message(client, message):
                 
                 try: 
                     # OPTION 1: Try Bot First 
-                    await app.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread)
+                    await app.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     success = True
                     print("✅ [DEBUG WATCHER] Bot Fast-Copy SUCCESS!")
                 except Exception as e1: 
@@ -2560,7 +2713,7 @@ async def process_watcher_message(client, message):
 
                     try: 
                         # OPTION 2: Try User Fallback (Copy)
-                        await client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread)
+                        await client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                         success = True
                         print("✅ [DEBUG WATCHER] Userbot Copy SUCCESS!")
                     except Exception as e2:
@@ -2812,4 +2965,3 @@ async def main():
         
 if __name__ == "__main__":
     app.run(main())
-        
