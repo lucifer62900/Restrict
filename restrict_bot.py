@@ -298,7 +298,6 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=50,                 
     sleep_threshold=20,
-    # max_concurrent_transmissions=10, 
     ipv6=False                    
 )
 
@@ -431,28 +430,53 @@ def generate_bar(percent: float, length: int = 12) -> str:
 def sanitize_filename(filename: str) -> str:
     if not filename: return "unnamed_file"
     filename = re.sub(r'[:]', "-", filename)
-    filename = re.sub(r'[\\/*?"<>|\[\]]', "", filename)
+    # FIX: DO NOT remove brackets here! Allowed characters updated.
+    filename = re.sub(r'[\\/*?"<>|]', "", filename)
     name, ext = os.path.splitext(filename)
-    if len(name) > 60:
-        name = name[:60]
+    # FIX: Increased slice limit to 150 characters so long titles are not truncated!
+    if len(name) > 150:
+        name = name[:150]
     if not ext:
         ext = ".dat"
     return f"{name}{ext}"
 
 # ==============================================================================
-# --- STRICT RENAME LOGIC (As per user instructions) ---
+# --- STRICT RENAME LOGIC (Updated to parse hidden Telegram Captions) ---
 # ==============================================================================
 def smart_rename(filename, caption_text=""):
     filename_str = str(filename or "Unknown_File.mkv")
     
-    name_raw = urllib.parse.unquote(filename_str)
-    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)$', name_raw, re.IGNORECASE)
+    caption_str = str(caption_text or "")
+    caption_str = re.sub(r'<[^>]+>', '', caption_str) # Strip existing HTML first
+    
+    name_raw = ""
+    
+    # 🧠 INTELLIGENT CAPTION SCANNER:
+    # Telegram often uses fake filenames (e.g. 188-207.mkv) and real names in the caption.
+    if caption_str:
+        for line in caption_str.split('\n'):
+            test_line = line.strip()
+            # Simulate junk removal to check if this line is purely junk (like a channel link)
+            test_clean = re.sub(r'^[-~\s]*\[.*?\][-~\s]*', '', test_line)
+            test_clean = re.sub(r'^[-~\s]*@[a-zA-Z0-9_]+[-~\s]*', '', test_clean)
+            for junk in [r'(?:https?:)?//\S+', r'\bwww\.\S+', r'@[a-zA-Z0-9_]+']:
+                test_clean = re.sub(junk, '', test_clean, flags=re.IGNORECASE)
+            
+            # If the line still has text after junk removal, it's the real title!
+            if len(test_clean.strip()) > 5:
+                name_raw = test_line
+                break
+    
+    # If the caption yielded no title, fallback to the physical filename
+    if not name_raw:
+        name_raw = urllib.parse.unquote(filename_str)
+        name_raw = re.sub(r'\.\w{3,4}$', '', name_raw) 
+        
+    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)$', filename_str, re.IGNORECASE)
     base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
     
-    clean_name = re.sub(r'\.\w{3,4}$', '', name_raw) 
-    
     # 1. Replace dots and underscores with spaces
-    clean_name = clean_name.replace('.', ' ').replace('_', ' ')
+    clean_name = name_raw.replace('.', ' ').replace('_', ' ')
     
     # 2. Remove leading junk blocks like [] or [@joinhere] or - [] at the VERY BEGINNING
     clean_name = re.sub(r'^[-~\s]*\[.*?\][-~\s]*', '', clean_name)
@@ -788,6 +812,7 @@ async def addsrc_cmd(client, message):
         ch_id = parts[1]
         name = parts[2]
         
+        # Validation Check: Ensure it's a valid ID or Username format
         if not (ch_id.startswith("-100") or ch_id.startswith("@") or ch_id.isdigit()):
             return await message.reply("❌ Invalid format. Must start with '-100' or '@'.\nExample: `/addsrc -100123456789 MyChannel`", reply_markup=close_btn)
             
@@ -2393,8 +2418,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
 
                 if is_success: success_count += 1
                 else: failed_count += 1
-                
-                # --- UPDATE PROGRESS ---
+
                 if not was_cancelled: 
                     await db.save_sync_progress(user_id, chatid_check, primary_dest, msgid)
 
