@@ -9,6 +9,7 @@ import subprocess
 import gc
 import datetime
 import uuid
+import urllib.parse
 from pathlib import Path
 from collections import defaultdict
 import motor.motor_asyncio
@@ -255,6 +256,22 @@ class Database:
             
         return result.modified_count > 0
 
+    # --- SAVED CHANNELS ENGINE ---
+    async def save_channel(self, user_id, ch_id, ch_type, name):
+        await self.db.saved_channels.update_one(
+            {"user_id": int(user_id), "channel_id": str(ch_id)},
+            {"$set": {"ch_type": ch_type, "name": name, "updated_at": datetime.datetime.now()}},
+            upsert=True
+        )
+
+    async def get_saved_channels(self, user_id, ch_type):
+        cursor = self.db.saved_channels.find({"user_id": int(user_id), "ch_type": ch_type})
+        return await cursor.to_list(length=100)
+
+    async def delete_saved_channel(self, user_id, ch_id):
+        result = await self.db.saved_channels.delete_one({"user_id": int(user_id), "channel_id": str(ch_id)})
+        return result.deleted_count > 0
+
 db = Database(DB_URI, DB_NAME)
 
 # ==============================================================================
@@ -409,6 +426,56 @@ def sanitize_filename(filename: str) -> str:
     if not ext:
         ext = ".dat"
     return f"{name}{ext}"
+
+# ==============================================================================
+# --- NEW EXACT RENAMING LOGIC ---
+# ==============================================================================
+def smart_rename(filename, caption_text=""):
+    """
+    Strips ONLY leading/trailing junk brackets, dots, underscores, and URLs.
+    Leaves the main title and specific internal bracket tags EXACTLY as they are.
+    """
+    filename_str = str(filename or "Unknown_File.mkv")
+    
+    # 1. Unquote the URL-encoded string
+    name_raw = urllib.parse.unquote(filename_str)
+    
+    # 2. Extract Base Extension
+    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)$', name_raw, re.IGNORECASE)
+    base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
+    
+    # Remove the extension temporarily to avoid breaking the text processing
+    clean_name = re.sub(r'\.\w{3,4}$', '', name_raw) 
+    
+    # 3. Replace dots and underscores with spaces
+    clean_name = clean_name.replace('.', ' ').replace('_', ' ')
+    
+    # 4. Remove leading junk specifically like "- []", "[]", "[@joinhere]", "@username "
+    # This prevents the bot from deleting [E188-207] in the middle of a string.
+    clean_name = re.sub(r'^[-~\s]*\[.*?\]\s*', '', clean_name)
+    clean_name = re.sub(r'^[-~\s]*@[a-zA-Z0-9_]+\s*', '', clean_name)
+    
+    # 5. Remove exact URL links and standalone @usernames anywhere inside
+    junk_patterns = [
+        r'(?:https?:)?//\S+', r'\bwww\.\S+', 
+        r'\b[a-zA-Z0-9-]+\.(com|net|org|in|site|cc|tk|ml|me|club|xyz|tv|one|movies|pro)\b',
+        r'@[a-zA-Z0-9_]+'
+    ]
+    
+    for junk in junk_patterns:
+        clean_name = re.sub(junk, '', clean_name, flags=re.IGNORECASE)
+
+    # 6. Final cleanup of multiple spaces
+    clean_name = re.sub(r'\s+', ' ', clean_name).strip(' -')
+    
+    if len(clean_name) <= 2:
+        clean_name = "Unknown Title"
+
+    perfect_caption = clean_name
+    perfect_filename = clean_name + base_ext
+
+    return perfect_caption, perfect_filename
+# ==============================================================================
 
 async def check_link_restriction(user_id, link_text):
     """
@@ -696,6 +763,136 @@ def get_message_type(msg: Message):
     return None
 
 # ==============================================================================
+# --- SAVED CHANNELS & SYNC MENU ---
+# ==============================================================================
+
+@app.on_message(filters.command(["addsrc"]) & filters.private)
+async def addsrc_cmd(client, message):
+    close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
+    try:
+        _, ch_id, name = message.text.split(maxsplit=2)
+        await db.save_channel(message.from_user.id, ch_id, "source", name)
+        await message.reply(f"✅ **Source Repository Inscribed:**\n`{ch_id}` - {name}", reply_markup=close_btn)
+    except:
+        await message.reply("❌ Formatting erratum. Utilize: `/addsrc [-100xxxx/@username] [Nomenclature]`", reply_markup=close_btn)
+
+@app.on_message(filters.command(["adddst"]) & filters.private)
+async def adddst_cmd(client, message):
+    close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
+    try:
+        _, ch_id, name = message.text.split(maxsplit=2)
+        await db.save_channel(message.from_user.id, ch_id, "dest", name)
+        await message.reply(f"✅ **Target Repository Inscribed:**\n`{ch_id}` - {name}", reply_markup=close_btn)
+    except:
+        await message.reply("❌ Formatting erratum. Utilize: `/adddst [-100xxxx/@username] [Nomenclature]`", reply_markup=close_btn)
+
+@app.on_message(filters.command(["delch"]) & filters.private)
+async def delch_cmd(client, message):
+    close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
+    try:
+        _, ch_id = message.text.split(maxsplit=1)
+        if await db.delete_saved_channel(message.from_user.id, ch_id):
+            await message.reply(f"🗑 **Repository {ch_id} obliterated successfully!**", reply_markup=close_btn)
+        else:
+            await message.reply("⚠️ Repository undetected in archival ledger.", reply_markup=close_btn)
+    except:
+        await message.reply("❌ Formatting erratum. Utilize: `/delch [-100xxxx/@username]`", reply_markup=close_btn)
+
+@app.on_message(filters.command(["channels"]) & filters.private)
+async def channels_cmd(client, message):
+    close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
+    sources = await db.get_saved_channels(message.from_user.id, "source")
+    destinations = await db.get_saved_channels(message.from_user.id, "dest")
+    
+    text = "📂 **Archived Source Repositories:**\n"
+    for ch in sources:
+        text += f"├ {ch['name']} (`{ch['channel_id']}`)\n"
+    if not sources:
+        text += "└ N/A\n"
+        
+    text += "\n🎯 **Archived Target Repositories:**\n"
+    for ch in destinations:
+        text += f"├ {ch['name']} (`{ch['channel_id']}`)\n"
+    if not destinations:
+        text += "└ N/A"
+        
+    await message.reply(text, reply_markup=close_btn)
+
+@app.on_message(filters.command(["sync"]) & filters.private)
+async def sync_cmd(client, message):
+    close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
+    sources = await db.get_saved_channels(message.from_user.id, "source")
+    if not sources:
+        return await message.reply("❌ Source archives barren! Execute `/addsrc` initially.", reply_markup=close_btn)
+        
+    buttons = []
+    for ch in sources:
+        buttons.append([InlineKeyboardButton(ch['name'], callback_data=f"sync_src_{ch['channel_id']}")])
+    buttons.append([InlineKeyboardButton("❌ Close", callback_data="close_menu")])
+        
+    await message.reply("📂 **Phase 1: Designate Source Repository**", reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex(r"^sync_src_"))
+async def sync_src_cb(client, query):
+    src_id = query.data.split("_")[2]
+    dests = await db.get_saved_channels(query.from_user.id, "dest")
+    
+    if not dests:
+        return await query.answer("❌ Target archives barren! Execute `/adddst` initially.", show_alert=True)
+        
+    buttons = []
+    for ch in dests:
+        buttons.append([InlineKeyboardButton(ch['name'], callback_data=f"sync_dst_{src_id}_{ch['channel_id']}")])
+    buttons.append([InlineKeyboardButton("❌ Close", callback_data="close_menu")])
+        
+    await query.message.edit("🎯 **Phase 2: Designate Target Repository**", reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex(r"^sync_dst_"))
+async def sync_dst_cb(client, query):
+    user_id = query.from_user.id
+    _, _, src_id, dst_id = query.data.split("_", 3)
+    
+    dests = await db.get_saved_channels(user_id, "dest")
+    dst_name = next((ch['name'] for ch in dests if str(ch['channel_id']) == str(dst_id)), f"Target {dst_id}")
+    
+    close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
+    
+    await query.message.edit("🔢 **Phase 3: Delineate Continuum**\n\nTransmit the numerical spectrum representing the messages.\n\n**Paradigm:**\n`1 - 100` (Transmits message ID 1 to 100)\n`all` (Encompasses the entire repository)\n\n*(Reply to this message)*", reply_markup=close_btn)
+    
+    range_msg = await client.ask(user_id, "Enter your continuum here (e.g. 10 - 200 or all):", timeout=120)
+    
+    if range_msg.text == "/cancel" or not range_msg.text:
+        return await range_msg.reply("❌ Synchronization aborted.", reply_markup=close_btn)
+
+    user_input = range_msg.text.strip().lower()
+    clean_src = str(src_id)
+    if clean_src.startswith("-100"):
+        clean_src = clean_src[4:] 
+        
+    if user_input == "all":
+        constructed_link = f"https://t.me/c/{clean_src}/1-all"
+    elif "-" in user_input:
+        constructed_link = f"https://t.me/c/{clean_src}/{user_input}"
+    else:
+        constructed_link = f"https://t.me/c/{clean_src}/{user_input}"
+    
+    wait_msg = await range_msg.reply("🔎 **Analyzing Cryptic Locator...**", quote=True)
+    is_restricted, status_text = await check_link_restriction(user_id, constructed_link)
+    await wait_msg.delete()
+
+    PENDING_TASKS[user_id] = {
+        "link": constructed_link,
+        "dest_chat_id": dst_id,
+        "dest_thread_id": None,
+        "dest_title": dst_name,
+        "status": "waiting_speed",
+        "is_restricted": is_restricted
+    }
+    
+    await range_msg.reply(f"✨ **Matrix Assimilated!**\n{status_text}", quote=True, reply_markup=close_btn)
+    await ask_for_speed(range_msg)
+
+# ==============================================================================
 # --- HANDLERS (START/HELP/STATUS/CANCEL/etc.) ---
 # ==============================================================================
 
@@ -778,7 +975,7 @@ async def send_cancel(client: Client, message: Message):
     # 2. Check if user has active downloads running
     user_tasks = ACTIVE_PROCESSES.get(user_id, {})
     if not user_tasks:
-        await message.reply("✅ **No active tasks to cancel.**")
+        await message.reply("✅ **No active tasks to cancel.**\n\n*(Note: To remove a Watcher, please use the /watchers command and click Delete, or use /unwatch)*")
         return
 
     # 3. Show menu to cancel active downloads
@@ -1413,7 +1610,7 @@ async def unwatch_callback(client, query):
 # --- CORE: receive links / start tasks / processing / cancel checks ---
 # ==============================================================================
 
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log", "addsrc", "adddst", "delch", "channels", "sync"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in PENDING_TASKS:
@@ -2019,13 +2216,20 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
 
             # Parse range
             last_segment = parts[-1].strip()
-            range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
-            if range_match:
-                fromID, toID = int(range_match.group(1)), int(range_match.group(2))
-            else:
-                fromID = toID = int(last_segment)
+            range_match = re.search(r"(\d+)\s*-\s*([a-zA-Z0-9]+)", text) # Supports 'all' keyword
+            
+            try: chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
+            except Exception: chatid_check = parts[0]
 
-            total_count = max(1, toID - fromID + 1)
+            if range_match:
+                fromID = int(range_match.group(1))
+                end_str = range_match.group(2).lower()
+                if end_str != "all":
+                    try: toID = int(end_str)
+                    except: toID = fromID
+            else:
+                try: fromID = toID = int(last_segment)
+                except: fromID = toID = 1
 
             # Session login
             user_data = await db.get_session(user_id)
@@ -2054,9 +2258,36 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 )
                 await acc.start()
                 is_temp_client = True
+                
+            # If 'all' was passed, fetch the latest msg ID
+            if range_match and range_match.group(2).lower() == "all":
+                try:
+                    async for last_msg in acc.get_chat_history(chatid_check, limit=1):
+                        toID = last_msg.id
+                except Exception as e:
+                    print(f"Failed to fetch last message for ALL: {e}")
+                    toID = fromID
+
+            primary_dest = targets[0]['dest_id'] if targets else "unknown_dest"
+            saved_msg_id = await db.get_sync_progress(user_id, chatid_check, primary_dest)
+
+            if saved_msg_id >= toID:
+                skip_msg = (f"⏭ **DUPLICATE SKIPPED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n✅ **Status:** Files up to ID `{toID}` are already synced.")
+                try: await client.send_message(message.chat.id, skip_msg, reply_to_message_id=message.id)
+                except: pass
+                if task_uuid in ACTIVE_PROCESSES.get(user_id, {}): del ACTIVE_PROCESSES[user_id][task_uuid]
+                if is_temp_client: await acc.stop()
+                return
+                
+            elif saved_msg_id >= fromID and saved_msg_id < toID:
+                fromID = saved_msg_id + 1
+                resume_msg = (f"♻️ **AUTO-RESUME ACTIVATED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n▶️ **Resuming From ID:** `{fromID}`")
+                try: await client.send_message(message.chat.id, resume_msg, reply_to_message_id=message.id)
+                except: pass
+
+            total_count = max(1, toID - fromID + 1)
             
             try:
-                chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
                 source_chat = await acc.get_chat(chatid_check)
                 source_title = source_chat.title or "Private Chat"
             except: pass
@@ -2130,6 +2361,9 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
 
                 if is_success: success_count += 1
                 else: failed_count += 1
+
+                if not was_cancelled: 
+                    await db.save_sync_progress(user_id, chatid_check, primary_dest, msgid)
 
                 # --- 3. UNIVERSAL SMART SLEEP ---
                 if index < total_count:
@@ -2248,6 +2482,16 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             if f"{m_id}:up" in PROGRESS: del PROGRESS[f"{m_id}:up"]
     except Exception: pass
 
+    original_filename = "unknown_file"
+    if msg.document and msg.document.file_name: original_filename = msg.document.file_name
+    elif msg.video and msg.video.file_name: original_filename = msg.video.file_name
+    elif msg.audio and msg.audio.file_name: original_filename = msg.audio.file_name
+    elif msg_type == "Photo": original_filename = f"{msgid}.jpg"
+    elif msg_type == "Voice": original_filename = f"{msgid}.ogg"
+
+    perfect_caption, perfect_filename = smart_rename(original_filename, msg.caption.html if msg.caption else "")
+    clean_caption = f"<b>{perfect_caption}</b>"
+
     # 1. FAST FORWARD (Copy to Multiple Targets)
     if not is_restricted and not getattr(msg, "has_protected_content", False) and not getattr(msg.chat, "has_protected_content", False):
         forward_success = False
@@ -2282,14 +2526,7 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
     task_folder_path = Path(f"./downloads/{user_id}/{task_uuid}/{msgid}/")
     task_folder_path.mkdir(parents=True, exist_ok=True)
 
-    original_filename = "unknown_file"
-    if msg.document and msg.document.file_name: original_filename = msg.document.file_name
-    elif msg.video and msg.video.file_name: original_filename = msg.video.file_name
-    elif msg.audio and msg.audio.file_name: original_filename = msg.audio.file_name
-    elif msg_type == "Photo": original_filename = f"{msgid}.jpg"
-    elif msg_type == "Voice": original_filename = f"{msgid}.ogg"
-
-    safe_filename = sanitize_filename(original_filename)
+    safe_filename = sanitize_filename(perfect_filename)
     if not safe_filename.strip(): safe_filename = f"{msgid}.dat"
     file_path_to_save = task_folder_path / safe_filename
 
@@ -2324,7 +2561,6 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                     
                     if f"{status_message.id}:up" in PROGRESS: del PROGRESS[f"{status_message.id}:up"]
                     up_task = asyncio.create_task(upstatus(client, status_message, chat_for_status, index, total_count, header_text))
-                    caption = msg.caption.html if msg.caption else ""
                     
                     # Split Multi-Upload
                     async with USER_SEMAPHORES[user_id]:
@@ -2340,7 +2576,7 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                                             await client.send_document(
                                                 dest_chat_id, 
                                                 str(part), 
-                                                caption=caption, 
+                                                caption=clean_caption, 
                                                 parse_mode=enums.ParseMode.HTML, 
                                                 reply_to_message_id=dest_thread_id,
                                                 progress=progress,  # <--- ADDED
@@ -2393,8 +2629,6 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
         if f"{status_message.id}:up" in PROGRESS: del PROGRESS[f"{status_message.id}:up"]
         up_task = asyncio.create_task(upstatus(client, status_message, chat_for_status, index, total_count, header_text))
         
-        caption = msg.caption.html if msg.caption else ""
-        
         # CHANGED: Hand the upload over to the Bot to bypass User Bandwidth limits!
         uploader = client 
 
@@ -2410,12 +2644,12 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                     while retry_count < 5: # Fight through network blips!
                         if task_uuid and CANCEL_FLAGS.get(task_uuid): break
                         try:
-                            if "Document" == msg_type: await uploader.send_document(dest_chat_id, file_path, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Video" == msg_type: await uploader.send_video(dest_chat_id, file_path, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Audio" == msg_type: await uploader.send_audio(dest_chat_id, file_path, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Photo" == msg_type: await uploader.send_photo(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
-                            elif "Voice" == msg_type: await uploader.send_voice(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Animation" == msg_type: await uploader.send_animation(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
+                            if "Document" == msg_type: await uploader.send_document(dest_chat_id, file_path, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Video" == msg_type: await uploader.send_video(dest_chat_id, file_path, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Audio" == msg_type: await uploader.send_audio(dest_chat_id, file_path, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Photo" == msg_type: await uploader.send_photo(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
+                            elif "Voice" == msg_type: await uploader.send_voice(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Animation" == msg_type: await uploader.send_animation(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
                             elif "Sticker" == msg_type: await uploader.send_sticker(dest_chat_id, file_path, reply_to_message_id=dest_thread_id)
                             success_local = True
                             break 
@@ -2681,36 +2915,36 @@ async def main():
     await app.start()
     print("🤖 Bot Started")
     
-    # --- AUTO-UPDATE COMMANDS (SCOPED) ---
-    print("📝 Updating Bot Commands...")
+    # --- AUTO-UPDATE COMMANDS ---
+    print("📝 Updating Commands...")
     try:
-        # A. Define the Public Commands (For Everyone)
         public_commands = [
-            BotCommand("start", "⚡ Check Bot Is Working Or Not"),
-            BotCommand("help", "🔎 Check How To Use Bot"),
-            BotCommand("login", "📍 Login Your Telegram String Session"),
-            BotCommand("logout", "🚨 Logout Your Session"),
-            BotCommand("dl", "🦥 Reply to the link to forward"),
-            BotCommand("watch", "👀 To live forward"),
-            BotCommand("unwatch", "🗑 Stop watching a source"),
-            BotCommand("watchers", "📋 List your active watchers"),
-            BotCommand("cancel", "❌ Cancel Your Any Ongoing Task")
+            BotCommand("start", "Commence the operational apparatus"),
+            BotCommand("help", "Peruse authoritative directives"),
+            BotCommand("login", "Authenticate cryptographic session"),
+            BotCommand("logout", "Sever the synchronized connection"),
+            BotCommand("dl", "Instigate extraction of digital asset"),
+            BotCommand("watch", "Deploy a vigilant automated sentinel"),
+            BotCommand("unwatch", "Dismantle an active sentinel"),
+            BotCommand("watchers", "Enumerate deployed sentinel configurations"),
+            BotCommand("addsrc", "Inscribe source repository into ledger"),
+            BotCommand("adddst", "Inscribe target repository into ledger"),
+            BotCommand("delch", "Obliterate registered repository"),
+            BotCommand("channels", "Exhibit archived repositories"),
+            BotCommand("sync", "Invoke mass-synchronization matrix"),
+            BotCommand("cancel", "Abort executing transmission sequence")
         ]
 
-        # B. Define Admin Commands (Public + Extra)
         admin_commands = public_commands + [
-            BotCommand("broadcast", "🗞 Broadcast Message"),
-            BotCommand("botstats", "🔎 Check User Stats"),
-            BotCommand("status", "🦥 Check System Status"),
-            BotCommand("log", "📄 Fetch Bot Logs"),
-            BotCommand("pixel", "✨ Bypass Pixeldrain Links")
+            BotCommand("broadcast", "Promulgate universal decree"),
+            BotCommand("botstats", "Scrutinize analytical metrics"),
+            BotCommand("status", "Monitor systemic vitality"),
+            BotCommand("log", "Retrieve chronological transcript"),
+            BotCommand("pixel", "Circumvent cryptographic obfuscation")
         ]
 
-        # C. Set Default Scope (Everyone sees public_commands)
         await app.set_bot_commands(public_commands, scope=BotCommandScopeDefault())
 
-        # D. Set Admin Scope (Admins see EVERYTHING)
-        # Combine ADMINS and SUDOS lists, remove duplicates
         all_admins = set(ADMINS + SUDOS)
         
         for admin_id in all_admins:
@@ -2722,11 +2956,9 @@ async def main():
             except Exception as e:
                 print(f"⚠️ Could not set commands for Admin {admin_id}: {e}")
                 
-        print("✅ Commands Updated: Public vs Admin scopes set!")
-        
+        print("✅ Commands Updated Successfully!")
     except Exception as e:
         print(f"⚠️ Failed to set commands: {e}")
-    # ----------------------------
     
     # 3. Smart Load: Only load sessions for users with ACTIVE Watchers
     print("🔄 Loading Sessions for Active Watchers...")
@@ -2812,4 +3044,3 @@ async def main():
         
 if __name__ == "__main__":
     app.run(main())
-        
