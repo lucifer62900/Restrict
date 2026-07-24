@@ -9,7 +9,6 @@ import subprocess
 import gc
 import datetime
 import uuid
-import urllib.parse
 from pathlib import Path
 from collections import defaultdict
 import motor.motor_asyncio
@@ -57,10 +56,11 @@ DB_NAME = os.environ.get("DB_NAME", "")
 STRING_SESSION = os.environ.get("STRING_SESSION", None)
 
 # Error Log Channel (Optional)
+# Usage: "-100xxxx" for channel, or "-100xxxx/5" for Group Topic
 LOG_CHANNEL = os.environ.get("LOG_CHANNEL", "") 
 
 # Queue System
-TASK_QUEUE = defaultdict(list) 
+TASK_QUEUE = defaultdict(list) # Stores pending tasks: user_id -> [task_data, ...]
 
 # Create a thread pool for blocking tasks
 io_executor = ThreadPoolExecutor(max_workers=4)
@@ -75,31 +75,37 @@ ADMINS = [int(x) for x in admin_str.split(",") if x.strip().isdigit()]
 sudo_str = os.environ.get("SUDOS", "")
 SUDOS = [int(x) for x in sudo_str.split(",") if x.strip().isdigit()]
 
-HELP_TXT = """<b>📚 COMPREHENSIVE OPERATIONAL DIRECTIVE (V5.2)</b>
+HELP_TXT = """<b>📚 BOT'S USAGE GUIDE</b>
 
 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬✘▬
 <blockquote expandable>
-<b>🟢 1. SINGLE & BATCH MASS-EXTRACTION</b>
-• Paste a singular URL to process an isolated asset.
-• Paste URLs denoting a specific continuum to process in bulk.
-• Type <b>all</b> as the terminal node to extract the entire repository!
+<b>🟢 1. SINGLE & BATCH DOWNLOADS</b>
+• Send a single link to process one post.
+• Send links in a "From - To" format to process multiple files at once.
+• Works for both Public and Private links.
 • <b>Examples:</b>
   ├ <code>https://t.me/xxxx/1001</code>
-  ├ <code>https://t.me/c/xxxx/101 - 120</code>
+  └ <code>https://t.me/c/xxxx/101 - 120</code>
 
-<b>💾 2. ARCHIVAL REPOSITORY MANAGER</b>
-• <code>/addsrc [ID/@username] [Nomenclature]</code> - Inscribe Source Channel.
-• <code>/adddst [ID/@username] [Nomenclature]</code> - Inscribe Target Channel.
-• <code>/channels</code> - Exhibit the grand compendium.
-• <code>/sync</code> - Invoke the synchronized mass-relay interface!
+<b>👀 2. LIVE WATCHERS (AUTO-FORWARDING)</b>
+• Automatically monitor a source and forward new messages to targets.
+• Supports routing to <b>Multiple Targets</b> simultaneously!
+• Features built-in <b>Content Filtering</b> (e.g., Only Videos & Docs).
+• <b>Setup:</b> Send <code>/watch https://t.me/channel/123</code>
+• <b>Manage:</b> Use <code>/watchers</code> to view and delete mappings.
 
-<b>👀 3. VIGILANT SENTINELS (AUTO-RELAY)</b>
-• <code>/watch https://t.me/channel/123</code> - Deploy an automated observer.
-• <code>/watchers</code> (or <code>/list</code>) - Enumerate deployed configurations.
+<b>🤖 3. BOT CHATS & RESTRICTED CONTENT</b>
+• Send the link with <code>/b/</code>, the bot's username, and message ID.
+• <b>Format:</b> <code>https://t.me/b/botusername/4321</code>
+• Bypasses "Saving Restricted Content" limits automatically!
 
-<b>🛠 4. UTILITY DIRECTIVES</b>
-• <code>/dl</code> - Reply to an asset's locator to execute transfer.
-• <code>/cancel</code> - Abort and instantaneously halt executions.
+<b>🛠 4. USEFUL COMMANDS</b>
+• <code>/dl</code> - Reply to a link to process it.
+• <code>/watch</code> - Setup a new live auto-forwarder.
+• <code>/watchers</code> (or <code>/list</code>) - View active watchers & filters.
+• <code>/removetarget</code> - Remove a specific destination.
+• <code>/removesource</code> (or <code>/unwatch</code>) - Stop watching a source.
+• <code>/cancel</code> - Cancel ongoing tasks.
 </blockquote>
 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬✘▬"""
 
@@ -173,23 +179,10 @@ class Database:
         count = await self.col.count_documents({"session": {"$ne": None}})
         return count
 
-    # --- SMART RESUME PROGRESS METHODS ---
-    async def save_sync_progress(self, user_id, source_id, dest_id, msg_id):
-        query = {"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)}
-        await self.db.sync_progress.update_one(
-            query,
-            {"$set": {"last_msg_id": int(msg_id), "updated_at": datetime.datetime.now()}},
-            upsert=True
-        )
-
-    async def get_sync_progress(self, user_id, source_id, dest_id):
-        data = await self.db.sync_progress.find_one({"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)})
-        return data.get("last_msg_id", 0) if data else 0
-
     # --- WATCHER METHODS ---
     async def add_watcher(self, user_id, source_id, dest_id, source_thread=None, dest_thread=None, delay=0, is_restricted=False, source_title=None, dest_title=None, allowed_types=None):
         if allowed_types is None:
-            allowed_types = ["Video", "Document"] 
+            allowed_types = ["Video", "Document"] # Default strict filter
 
         query = {
             'source_id': int(source_id),
@@ -205,6 +198,7 @@ class Database:
         existing = await self.db.watchers.find_one(query)
         if existing:
             targets = existing.get("targets", [])
+            # Convert legacy dest_id to targets automatically
             if not targets and 'dest_id' in existing:
                 targets = [{"dest_id": existing['dest_id'], "dest_thread": existing.get('dest_thread'), "dest_title": existing.get('dest_title')}]
                 
@@ -254,27 +248,12 @@ class Database:
             {"$pull": {"targets": {"dest_id": int(dest_id)}}}
         )
         
+        # If targets array becomes empty, delete the whole watcher automatically
         doc = await self.db.watchers.find_one(query)
         if doc and not doc.get("targets"):
             await self.db.watchers.delete_one(query)
             
         return result.modified_count > 0
-
-    # --- SAVED CHANNELS ENGINE (NEW) ---
-    async def save_channel(self, user_id, ch_id, ch_type, name):
-        await self.db.saved_channels.update_one(
-            {"user_id": int(user_id), "channel_id": str(ch_id)},
-            {"$set": {"ch_type": ch_type, "name": name, "updated_at": datetime.datetime.now()}},
-            upsert=True
-        )
-
-    async def get_saved_channels(self, user_id, ch_type):
-        cursor = self.db.saved_channels.find({"user_id": int(user_id), "ch_type": ch_type})
-        return await cursor.to_list(length=100)
-
-    async def delete_saved_channel(self, user_id, ch_id):
-        result = await self.db.saved_channels.delete_one({"user_id": int(user_id), "channel_id": str(ch_id)})
-        return result.deleted_count > 0
 
 db = Database(DB_URI, DB_NAME)
 
@@ -289,15 +268,17 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=50,                 
     sleep_threshold=20,
+    # max_concurrent_transmissions=10, 
     ipv6=False                    
 )
 
 # ==============================================================================
-# --- NATIVE ASK IMPLEMENTATION ---
+# --- NATIVE ASK IMPLEMENTATION (REPLACES PYROMOD) ---
 # ==============================================================================
 ASK_FUTURES = {}
 
 async def custom_ask(self, chat_id: int, text: str, filters=None, timeout: int = 300, **kwargs):
+    """Native implementation of bot.ask() to bypass pyromod bugs."""
     msg = await self.send_message(chat_id, text, **kwargs)
     loop = asyncio.get_running_loop()
     future = loop.create_future()
@@ -308,6 +289,7 @@ async def custom_ask(self, chat_id: int, text: str, filters=None, timeout: int =
     except asyncio.TimeoutError:
         ASK_FUTURES.pop(chat_id, None)
         
+        # Simulate a /cancel message if the user times out
         class MockMessage:
             text = "/cancel"
             async def reply(self, reply_text, *args, **kw):
@@ -317,8 +299,10 @@ async def custom_ask(self, chat_id: int, text: str, filters=None, timeout: int =
         mock_msg._client = self
         return mock_msg
 
+# Bind the custom method to all Pyrogram Clients
 Client.ask = custom_ask
 
+# A specialized background listener to catch the user's reply
 @app.on_message(filters.private, group=-1)
 async def ask_listener(client, message):
     chat_id = message.chat.id
@@ -330,27 +314,31 @@ async def ask_listener(client, message):
             if asyncio.iscoroutine(is_match):
                 is_match = await is_match
             if not is_match:
-                return 
+                return # Ignore this message, wait for a matching one
                 
         ASK_FUTURES.pop(chat_id, None)
         if not future.done():
             future.set_result(message)
         message.stop_propagation()
-
 # ==============================================================================
 
 BOT_START_TIME = time.time()
 
-ACTIVE_PROCESSES = defaultdict(dict)  
-CANCEL_FLAGS = {}  
+ACTIVE_PROCESSES = defaultdict(dict)  # user_id -> { task_uuid: info_dict, ... }
+CANCEL_FLAGS = {}  # task_uuid -> True when cancelled
 
 batch_temp = type("BT", (), {})()
 batch_temp.ACTIVE_TASKS = defaultdict(int)
+# IS_BATCH removed — cancellation is handled per task_uuid via CANCEL_FLAGS
 
 # --- ROBUST CONCURRENCY SETTINGS ---
+# 1. Server Limit: Max 30 uploads total (Protects your server CPU/Bandwidth)
 SERVER_UPLOAD_LIMIT = asyncio.Semaphore(30) 
+
+# 2. User Limit: Max 3 uploads per user (Protects user from FloodWait)
 USER_SEMAPHORE_LIMIT = 3 
 USER_SEMAPHORES = defaultdict(lambda: asyncio.Semaphore(USER_SEMAPHORE_LIMIT))
+# -----------------------------------
 
 PENDING_TASKS = {}
 PROGRESS = {}
@@ -358,7 +346,7 @@ SESSION_STRING_SIZE = 351
 
 MAX_CONCURRENT_TASKS_PER_USER = int(os.environ.get("MAX_TASKS_PER_USER", "3"))
 
-USER_CLIENTS = {} 
+USER_CLIENTS = {} # Dictionary: {user_id: Client_Object}
 
 ALL_MSG_TYPES = ["Video", "Document", "Text", "Audio", "Photo", "Voice", "Animation", "Sticker"]
 
@@ -396,7 +384,9 @@ def get_readable_time(seconds: int) -> str:
     return " ".join(time_parts)
 
 def generate_bar(percent: float, length: int = 12) -> str:
+    """Generates a status bar in the style: 〘⬤⬤⬤⬤◔○○○○○○○〙 34.3%"""
     filled_length = int(length * percent / 100)
+    # Determine if we need a half-filled circle (◔)
     fraction = (percent / 100 * length) - filled_length
     has_half = fraction >= 0.5
     
@@ -420,98 +410,15 @@ def sanitize_filename(filename: str) -> str:
         ext = ".dat"
     return f"{name}{ext}"
 
-# ==============================================================================
-# --- 🧠 SAFE & SMART RENAME LOGIC (FIXED FOR @USERNAME & UNDERSCORES) ---
-# ==============================================================================
-def smart_rename(filename, caption_text=""):
-    filename_str = str(filename or "Unknown_File.mkv")
-    caption_str = str(caption_text or "")
-    
-    name_raw = urllib.parse.unquote(filename_str)
-    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', name_raw, re.IGNORECASE)
-    base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
-    name_raw = re.sub(r'\.\w{3,4}$', '', name_raw) 
-    full_text = f"{name_raw} {caption_str}"
-    
-    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', full_text)
-    year = year_match.group(1) if year_match else ""
-
-    res = ""
-    if re.search(r'2160p|4k', full_text, re.I): res = "4K"
-    elif re.search(r'1080p', full_text, re.I): res = "1080p"
-    elif re.search(r'720p', full_text, re.I): res = "720p"
-    elif re.search(r'480p', full_text, re.I): res = "480p"
-
-    codec = ""
-    if re.search(r'x265|hevc', full_text, re.I): codec = "HEVC"
-    elif re.search(r'x264|avc', full_text, re.I): codec = "AVC"
-
-    langs_found = []
-    if re.search(r'\bhindi\b', full_text, re.I): langs_found.append("Hindi")
-    if re.search(r'\btamil\b', full_text, re.I): langs_found.append("Tamil")
-    if re.search(r'\btelugu\b', full_text, re.I): langs_found.append("Telugu")
-    if re.search(r'\bbengali\b', full_text, re.I): langs_found.append("Bengali")
-    if re.search(r'\bmalayalam\b', full_text, re.I): langs_found.append("Malayalam")
-    if re.search(r'\benglish\b', full_text, re.I): langs_found.append("English")
-    
-    lang = "" 
-    if re.search(r'\b(multi|dual)\b', full_text, re.I) or len(langs_found) > 1: 
-        lang = "Multi Audio"
-    elif len(langs_found) == 1:
-        lang = langs_found[0]
-
-    clean_name = name_raw
-    clean_name = re.sub(r'^@[a-zA-Z0-9_]+[-_]?', '', clean_name)
-    clean_name = re.sub(r'@[a-zA-Z0-9_]+$', '', clean_name)
-    clean_name = re.sub(r'\s@[a-zA-Z0-9_]+', '', clean_name)
-    clean_name = re.sub(r'\[@[a-zA-Z0-9_]+\]', '', clean_name)
-    
-    junk_patterns = [
-        r'(?:https?:)?//\S+', r'\bwww\.\S+', 
-        r'\b[a-zA-Z0-9-]+\.(com|net|org|in|site|cc|tk|ml|me|club|xyz|tv|one|movies|pro)\b',
-        r'\b(skyemovies|hdhub4u|tamiletc|toonworld4all|mlwbd|vegmovies|desicinemas|1tamilmv|tamilmv|katmoviehd|moviesverse)\b',
-        r'join\s*(?:&|and)?\s*share', r'join\s*channel', r'join\s*here', r'join\s*now', r'subscribe', r'downloaded from',
-        r'🎞', r'📸', r'▬', r'🔥', r'👇', r'🔗', r':-', r'==', r'\|', r'~', r'⚡', r'⭐', r'✨', r'▶', r'💖',
-        r'\bUNRATED\b', r'\bUNRATEDXX\b', r'\bESub\b', r'\bEsubs\b'
-    ]
-    
-    for junk in junk_patterns:
-        clean_name = re.sub(junk, '', clean_name, flags=re.IGNORECASE)
-
-    clean_name = clean_name.replace('.', ' ').replace('_', ' ').replace('+', ' ')
-    split_regex = r'\b(1080p|720p|480p|2160p|4k|bluray|web-dl|web-rip|webrip|hdrip|brrip|x264|x265|hevc|avc|hindi|tamil|telugu|bengali|malayalam|english|dual audio|multi audio)\b'
-    extracted = re.split(split_regex, clean_name, flags=re.I)[0].strip()
-    
-    if year and year in extracted:
-        extracted = extracted.replace(year, '')
-        
-    extracted = re.sub(r'[\(\[].*?[\)\]]', '', extracted)
-    extracted = re.sub(r'\s+', ' ', extracted).strip(' -_()[]')
-
-    if len(extracted) <= 2 or extracted.lower() in ['mp4', 'mkv', 'avi']:
-        extracted = clean_name
-        extracted = re.sub(split_regex, '', extracted, flags=re.I)
-        if year: extracted = extracted.replace(year, '')
-        extracted = re.sub(r'\s+', ' ', extracted).strip(' -_()[]')
-        if len(extracted) <= 2:
-            extracted = "Unknown Title"
-
-    parts = [extracted]
-    if year: parts.append(f"({year})")
-    if lang: parts.append(f"[{lang}]")
-    if res: parts.append(f"[{res}]")
-    if codec: parts.append(f"[{codec}]")
-    
-    perfect_caption = " ".join(parts)
-    perfect_filename = perfect_caption + base_ext
-
-    return perfect_caption, perfect_filename
-
-# ==============================================================================
-
 async def check_link_restriction(user_id, link_text):
+    """
+    Analyzes the link to determine if the source content is restricted.
+    Handles both Post Links (t.me/c/xx/100) and Channel Links (t.me/c/xx).
+    """
+    # 1. Standardize the link
     clean_text = link_text.replace("https://", "").replace("http://", "").replace("t.me/", "").replace("c/", "")
     
+    # Remove any range "100-200"
     if "-" in clean_text:
         clean_text = clean_text.split("-")[0].strip()
         
@@ -525,12 +432,17 @@ async def check_link_restriction(user_id, link_text):
         if "t.me/b/" in link_text:
             return False, "🤖 **Bot Link:** Content availability depends on the bot."
             
+        # LOGIC FIX: Distinguish between Channel ID and Message ID
         if "t.me/c/" in link_text:
+            # Private Link Format: ID / (Optional Topic) / (Optional MsgId)
             is_private = True
             chat_id = int("-100" + parts[0])
+            
+            # If there's more than 1 part, the last part MIGHT be a message ID
             if len(parts) > 1 and parts[-1].isdigit():
                 msg_id = int(parts[-1])
         else:
+            # Public Link Format: Username / (Optional MsgId)
             chat_id = parts[0]
             if len(parts) > 1 and parts[-1].isdigit():
                 msg_id = int(parts[-1])
@@ -538,20 +450,21 @@ async def check_link_restriction(user_id, link_text):
     except Exception as e:
         return None, f"⚠️ **Could not analyze link.** Error: {e}"
 
+    # 2. Select the Client (User vs Bot)
     is_temp_client = False
     check_client = app 
     
     if is_private:
         user_session = await db.get_session(user_id)
         if not user_session:
-            return None, "🔒 **Confidential Sector:** Authenticate via /login."
+            return None, "🔒 **Private Link:** Please /login to verify restrictions."
         
         api_id = await db.get_api_id(user_id)
         api_hash = await db.get_api_hash(user_id)
-        # Session Memory Flag Enabled
         check_client = Client(f"check_{user_id}_{int(time.time())}", session_string=user_session, api_id=api_id, api_hash=api_hash, no_updates=True, ipv6=False, in_memory=True)
         is_temp_client = True
 
+    # 3. Check the Content
     is_restricted = False
     status_msg = ""
     
@@ -559,26 +472,29 @@ async def check_link_restriction(user_id, link_text):
         if is_temp_client:
             await check_client.connect()
             
+        # If we have a specific message ID, check that message
         if msg_id:
             msg = await check_client.get_messages(chat_id, msg_id)
             if getattr(msg.chat, "has_protected_content", False) or getattr(msg, "has_protected_content", False):
                 is_restricted = True
-                status_msg = "🔒 **Source is RESTRICTED** (Download Mode enforced)"
+                status_msg = "🔒 **Source is RESTRICTED** (Will use Download Mode)"
             else:
                 is_restricted = False
-                status_msg = "🔓 **Source is PUBLIC** (Fast-Relay enabled)"
+                status_msg = "🔓 **Source is PUBLIC/UNRESTRICTED** (Will use Fast Forward)"
+        
+        # If no message ID (Whole Channel Link), check the Chat info
         else:
             chat = await check_client.get_chat(chat_id)
             if getattr(chat, "has_protected_content", False):
                 is_restricted = True
-                status_msg = "🔒 **Channel is RESTRICTED** (Download Mode enforced)"
+                status_msg = "🔒 **Channel is RESTRICTED** (Will use Download Mode)"
             else:
                 is_restricted = False
-                status_msg = "🔓 **Channel is PUBLIC**"
+                status_msg = "🔓 **Channel is PUBLIC/UNRESTRICTED**"
             
     except Exception as e:
         if "CHANNEL_PRIVATE" in str(e) or "USER_NOT_PARTICIPANT" in str(e):
-            status_msg = "⚠️ **Verification Failed:** Access denied or invalid reference."
+            status_msg = "⚠️ **Private Chat:** I can't check yet (You need to join first)."
         else:
             status_msg = f"⚠️ **Check Failed:** `{str(e)[:30]}...`"
     finally:
@@ -589,10 +505,19 @@ async def check_link_restriction(user_id, link_text):
     return is_restricted, status_msg
     
 async def split_file_python(file_path, chunk_size=2000*1024*1024):
+    """
+    Async wrapper that runs the blocking smart split function in a separate thread.
+    """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(io_executor, _split_file_smart, file_path, chunk_size)
 
 def _split_file_smart(file_path, chunk_size):
+    """
+    Tiered Splitting Logic:
+    1. Try Linux 'split' (Fastest, Zero RAM)
+    2. Try '7z' (Fast, Low RAM, Archive format)
+    3. Fallback to Python (Safe, Optimized Buffer)
+    """
     file_path = Path(file_path)
     if not file_path.exists():
         return []
@@ -601,6 +526,7 @@ def _split_file_smart(file_path, chunk_size):
     if file_size <= chunk_size:
         return [file_path]
 
+    # --- TIER 1: LINUX 'SPLIT' (Preferred) ---
     if shutil.which("split"):
         try:
             output_prefix = f"{file_path}.part"
@@ -610,6 +536,7 @@ def _split_file_smart(file_path, chunk_size):
             if parts: return parts
         except Exception: pass
 
+    # --- TIER 2: 7-ZIP (Store Mode) ---
     seven_z_exe = shutil.which("7z") or shutil.which("7za")
     if seven_z_exe:
         try:
@@ -620,8 +547,10 @@ def _split_file_smart(file_path, chunk_size):
             if parts: return parts
         except Exception: pass
 
+    # --- TIER 3: PYTHON (Fallback / Low RAM) ---
     part_num = 0
     parts = []
+    # [OPTIMIZATION] Low Buffer for Koyeb Free Tier (2MB)
     buffer_size = 2 * 1024 * 1024 
     
     with open(file_path, 'rb') as source:
@@ -652,6 +581,7 @@ def progress(current, total, message, typ, task_uuid=None):
     except:
         return
         
+    # Make key globally unique across all users
     key = f"{chat_id}:{msg_id}:{typ}"
     now = time.time()
     if key not in PROGRESS:
@@ -688,15 +618,16 @@ async def downstatus(client: Client, status_message: Message, chat, index: int, 
         if rec["current"] == rec["total"] and rec["total"] > 0:
             break
             
+        # Add the Header Text (Filter info) if it exists
         header_section = f"{header_text}\n" if header_text else ""
 
         status = (
-            f"📥 **Downloading Extract ({index}/{total_count})**\n"
+            f"📥 **Downloading File ({index}/{total_count})**\n"
             f"└ 📂 `{max(0, total_count-index)}` remaining\n\n"
             f"**{rec.get('percent', 0):.1f}%** │ `{generate_bar(rec.get('percent', 0), length=12)}`\n\n"
             f"{header_section}"
-            f"🚀 **Velocity:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
-            f"💾 **Capacity:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
+            f"🚀 **Speed:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
+            f"💾 **Size:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
             f"⏳ **ETA:** `{get_readable_time(int(rec.get('eta', 0)) if rec.get('eta') else 0)}`"
         )
 
@@ -707,6 +638,7 @@ async def downstatus(client: Client, status_message: Message, chat, index: int, 
             except Exception:
                 pass
         
+        # --- DYNAMIC SLEEP LOGIC ---
         total_size = rec.get("total", 0)
         if total_size > 0 and total_size < 50 * 1024 * 1024:
             await asyncio.sleep(9) 
@@ -729,12 +661,12 @@ async def upstatus(client: Client, status_message: Message, chat, index: int, to
         header_section = f"{header_text}\n" if header_text else ""
 
         status = (
-            f"☁️ **Uploading Payload ({index}/{total_count})**\n"
+            f"☁️ **Uploading File ({index}/{total_count})**\n"
             f"└ 📤 `{max(0, total_count-index)}` remaining\n\n"
             f"**{rec.get('percent', 0):.1f}%** │ `{generate_bar(rec.get('percent', 0), length=12)}`\n\n"
             f"{header_section}"
-            f"🚀 **Velocity:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
-            f"💾 **Capacity:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
+            f"🚀 **Speed:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
+            f"💾 **Size:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
             f"⏳ **ETA:** `{get_readable_time(int(rec.get('eta', 0)) if rec.get('eta') else 0)}`"
         )
 
@@ -745,6 +677,7 @@ async def upstatus(client: Client, status_message: Message, chat, index: int, to
             except Exception:
                 pass
         
+        # --- DYNAMIC SLEEP LOGIC ---
         total_size = rec.get("total", 0)
         if total_size > 0 and total_size < 50 * 1024 * 1024:
             await asyncio.sleep(9) 
@@ -763,119 +696,11 @@ def get_message_type(msg: Message):
     return None
 
 # ==============================================================================
-# --- 💾 SAVED CHANNELS & SYNC MENU ---
-# ==============================================================================
-
-@app.on_message(filters.command(["addsrc"]) & filters.private)
-async def addsrc_cmd(client, message):
-    try:
-        _, ch_id, name = message.text.split(maxsplit=2)
-        await db.save_channel(message.from_user.id, ch_id, "source", name)
-        await message.reply(f"✅ **Source Repository Inscribed:**\n`{ch_id}` - {name}")
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/addsrc [-100xxxx/@username] [Nomenclature]`")
-
-@app.on_message(filters.command(["adddst"]) & filters.private)
-async def adddst_cmd(client, message):
-    try:
-        _, ch_id, name = message.text.split(maxsplit=2)
-        await db.save_channel(message.from_user.id, ch_id, "dest", name)
-        await message.reply(f"✅ **Target Repository Inscribed:**\n`{ch_id}` - {name}")
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/adddst [-100xxxx/@username] [Nomenclature]`")
-
-@app.on_message(filters.command(["delch"]) & filters.private)
-async def delch_cmd(client, message):
-    try:
-        _, ch_id = message.text.split(maxsplit=1)
-        if await db.delete_saved_channel(message.from_user.id, ch_id):
-            await message.reply(f"🗑 **Repository {ch_id} obliterated successfully!**")
-        else:
-            await message.reply("⚠️ Repository undetected in archival ledger.")
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/delch [-100xxxx/@username]`")
-
-@app.on_message(filters.command(["channels"]) & filters.private)
-async def channels_cmd(client, message):
-    sources = await db.get_saved_channels(message.from_user.id, "source")
-    destinations = await db.get_saved_channels(message.from_user.id, "dest")
-    
-    text = "📂 **Archived Source Repositories:**\n"
-    for ch in sources:
-        text += f"├ {ch['name']} (`{ch['channel_id']}`)\n"
-    if not sources:
-        text += "└ N/A\n"
-        
-    text += "\n🎯 **Archived Target Repositories:**\n"
-    for ch in destinations:
-        text += f"├ {ch['name']} (`{ch['channel_id']}`)\n"
-    if not destinations:
-        text += "└ N/A"
-        
-    await message.reply(text)
-
-@app.on_message(filters.command(["sync"]) & filters.private)
-async def sync_cmd(client, message):
-    sources = await db.get_saved_channels(message.from_user.id, "source")
-    if not sources:
-        return await message.reply("❌ Source archives barren! Execute `/addsrc` initially.")
-        
-    buttons = []
-    for ch in sources:
-        buttons.append([InlineKeyboardButton(ch['name'], callback_data=f"sync_src_{ch['channel_id']}")])
-        
-    await message.reply("📂 **Phase 1: Designate Source Repository**", reply_markup=InlineKeyboardMarkup(buttons))
-
-@app.on_callback_query(filters.regex(r"^sync_src_"))
-async def sync_src_cb(client, query):
-    src_id = query.data.split("_")[2]
-    dests = await db.get_saved_channels(query.from_user.id, "dest")
-    
-    if not dests:
-        return await query.answer("❌ Target archives barren! Execute `/adddst` initially.", show_alert=True)
-        
-    buttons = []
-    for ch in dests:
-        buttons.append([InlineKeyboardButton(ch['name'], callback_data=f"sync_dst_{src_id}_{ch['channel_id']}")])
-        
-    await query.message.edit("🎯 **Phase 2: Designate Target Repository**", reply_markup=InlineKeyboardMarkup(buttons))
-
-@app.on_callback_query(filters.regex(r"^sync_dst_"))
-async def sync_dst_cb(client, query):
-    user_id = query.from_user.id
-    _, _, src_id, dst_id = query.data.split("_", 3)
-    
-    await query.message.edit("🔢 **Phase 3: Delineate Continuum**\n\nTransmit the numerical spectrum representing the messages.\n\n**Paradigm:**\n`1 - 100` (Transmits message ID 1 to 100)\n`all` (Encompasses the entire repository)")
-    
-    range_msg = await client.ask(user_id, "Enter your continuum here (e.g. 10 - 200 or all):", timeout=120)
-    
-    if range_msg.text == "/cancel" or not range_msg.text:
-        return await range_msg.reply("❌ Synchronization aborted.")
-
-    clean_src = str(src_id).replace("-100", "") if str(src_id).startswith("-100") else str(src_id)
-    constructed_link = f"https://t.me/c/{clean_src}/{range_msg.text.strip()}"
-    
-    wait_msg = await range_msg.reply("🔎 **Analyzing Cryptic Locator...**", quote=True)
-    is_restricted, status_text = await check_link_restriction(user_id, constructed_link)
-    await wait_msg.delete()
-
-    PENDING_TASKS[user_id] = {
-        "link": constructed_link,
-        "dest_chat_id": dst_id,
-        "dest_thread_id": None,
-        "dest_title": f"Target Matrix {dst_id}",
-        "status": "waiting_speed",
-        "is_restricted": is_restricted
-    }
-    
-    await range_msg.reply(f"✨ **Matrix Assimilated!**\n{status_text}", quote=True)
-    await ask_for_speed(range_msg)
-
-# ==============================================================================
-# --- HANDLERS ---
+# --- HANDLERS (START/HELP/STATUS/CANCEL/etc.) ---
 # ==============================================================================
 
 async def test_destination_access(client: Client, chat_id, thread_id=None):
+    """Sends a dummy message to verify write permissions, then deletes it."""
     try:
         test_msg = await client.send_message(
             chat_id=chat_id,
@@ -889,16 +714,18 @@ async def test_destination_access(client: Client, chat_id, thread_id=None):
         
 @app.on_message(filters.command(["start"]) & (filters.private | filters.group))
 async def send_start(client: Client, message: Message):
+    # --- 1. Log and Save User (Database) ---
     user_id = message.from_user.id
     user_name = message.from_user.first_name
     
     try:
         if not await db.is_user_exist(user_id):
             await db.add_user(user_id, user_name)
-            print(f"New user {user_id} saved to database.") 
+            print(f"New user {user_id} saved to database.") # Simple logging
     except Exception as e:
         print(f"Failed to save user {user_id}: {e}")
 
+    # --- 2. Send Welcome Video & Text ---
     welcome_video_url = "https://files.catbox.moe/o9azww.mp4"
     welcome_text = (
         f"<b>👋 Hi {message.from_user.mention}, I am Save Restricted Content Bot.</b>\n\n"
@@ -911,6 +738,7 @@ async def send_start(client: Client, message: Message):
         [InlineKeyboardButton('🔍 sᴜᴘᴘᴏʀᴛ ɢʀᴏᴜᴘ', url='https://t.me/telegram'), InlineKeyboardButton('🤖 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/telegram')]
     ]
 
+    # Try sending video, fall back to message if video fails/is invalid
     try:
         await client.send_video(
             chat_id=message.chat.id, 
@@ -920,6 +748,7 @@ async def send_start(client: Client, message: Message):
             reply_to_message_id=message.id
         )
     except Exception as e:
+        # Fallback if video link dies or fails
         await client.send_message(
             chat_id=message.chat.id,
             text=welcome_text,
@@ -940,16 +769,19 @@ async def send_help(client: Client, message: Message):
 async def send_cancel(client: Client, message: Message):
     user_id = message.from_user.id
 
+    # 1. Check if user is stuck in "Setup Mode" (waiting for ID or Delay)
     if user_id in PENDING_TASKS:
         del PENDING_TASKS[user_id]
         await message.reply("✅ **Setup process cancelled.** You can send a new link now.")
         return
 
+    # 2. Check if user has active downloads running
     user_tasks = ACTIVE_PROCESSES.get(user_id, {})
     if not user_tasks:
-        await message.reply("✅ **No active tasks to cancel.**\n\n*(Note: To remove a Watcher, please use the /watchers command and click Delete, or use /unwatch)*")
+        await message.reply("✅ **No active tasks to cancel.**")
         return
 
+    # 3. Show menu to cancel active downloads
     buttons = []
     for tid, info in list(user_tasks.items()):
         label = info.get("item", "Task")
@@ -969,15 +801,19 @@ async def cancel_callback(client: Client, query):
     user_id = query.from_user.id
     data = query.data
 
+    # --- FIX: Handle "cancel_setup" here because the regex ^cancel_ catches it ---
     if data == "cancel_setup":
         if user_id in PENDING_TASKS:
             del PENDING_TASKS[user_id]
         await query.message.edit("❌ **Task Setup Cancelled.**")
         return
+    # --------------------------------------------------------------------------
 
     if data == "cancel_all":
+        # --- ADD THIS: Clear pending queue first ---
         if user_id in TASK_QUEUE:
             TASK_QUEUE[user_id].clear()
+        # -------------------------------------------
         
         user_tasks = list(ACTIVE_PROCESSES.get(user_id, {}).keys())
         if not user_tasks:
@@ -986,7 +822,7 @@ async def cancel_callback(client: Client, query):
             except: pass
             return
         for tid in user_tasks:
-            CANCEL_FLAGS[tid] = True 
+            CANCEL_FLAGS[tid] = True  # Per-task flag — does NOT affect other users
         await query.message.edit("**🛑 Cancelling ALL your tasks...**\n(This may take a moment to stop current downloads)")
         return
 
@@ -1018,7 +854,10 @@ async def pixel_bypass_handler(client: Client, message: Message):
             "`/pixel link1,link2,link3`"
         )
 
+    # Extract the input string after the command
     input_text = message.text.split(None, 1)[1]
+    
+    # Extract all Pixeldrain IDs using Regex
     matches = re.findall(r"pixeldrain\.com/u/([a-zA-Z0-9_-]+)", input_text)
     
     if not matches:
@@ -1027,10 +866,12 @@ async def pixel_bypass_handler(client: Client, message: Message):
             "Please ensure the links follow the format: `https://pixeldrain.com/u/XXXX`"
         )
 
+    # Build the text with Original and Bypassed links, line by line
     lines = []
     for match in matches:
         orig = f"https://pixeldrain.com/u/{match}"
         byp = f"https://cdn.pixeldrain.eu.cc/{match}"
+        # The backticks ` ` around the bypassed link allow for single-tap copying
         lines.append(f"🔗 **Original:** {orig}\n🔓 **Bypassed:** `{byp}`\n")
         
     bypassed_text = "\n".join(lines)
@@ -1053,6 +894,7 @@ async def status_style_handler(client, message):
     mem = psutil.virtual_memory().percent
     cpu = psutil.cpu_percent()
     
+    # Get Disk Usage
     total, used, free = shutil.disk_usage(".")
     disk_free = free / (1024**3)
     
@@ -1066,7 +908,9 @@ async def status_style_handler(client, message):
             dst = info.get("dest_title_name", "Destination")
             queue_list.append(f"• {src} → {dst}")
     
+    # Count Active Watchers
     watcher_count = await db.db.watchers.count_documents({})
+    
     queue_text = "\n".join(queue_list) if queue_list else "😴 No active downloads."
 
     msg = (
@@ -1111,6 +955,7 @@ async def bot_stats_handler(client: Client, message: Message):
                     
                     percent = (curr / tot * 100) if tot > 0 else 0
                     
+                    # ETA Math
                     elapsed = time.time() - start_t
                     eta_str = "Calculating..."
                     if curr > 0 and elapsed > 0:
@@ -1136,7 +981,7 @@ async def bot_stats_handler(client: Client, message: Message):
     await wait.edit(stats_msg)
         
 # ==============================================================================
-# --- LOGIN / LOGOUT ---
+# --- LOGIN / LOGOUT (async login handler inserted) ---
 # ==============================================================================
 
 @app.on_message(filters.private & ~filters.forwarded & filters.command(["logout"]))
@@ -1147,13 +992,16 @@ async def logout(client, message):
 
     status_msg = await message.reply("📡 **Connecting to Telegram to terminate session...**")
 
+    # 1. Get session details needed to connect
     session_string = await db.get_session(user_id)
     api_id = await db.get_api_id(user_id)
     api_hash = await db.get_api_hash(user_id)
 
+    # 2. Perform Remote Logout (Remove from Devices)
     if session_string:
         user_client = None
         try:
+            # Use stored keys or fallback to global env
             use_api_id = int(api_id) if api_id else API_ID
             use_api_hash = api_hash if api_hash else API_HASH
             
@@ -1167,18 +1015,23 @@ async def logout(client, message):
             )
             
             await user_client.connect()
+            
+            # Try to logout, ignoring "Already Terminated" errors
             try:
                 await user_client.log_out()
                 await status_msg.edit("✅ **Session successfully removed from Telegram Devices.**")
             except Exception as e:
+                # If the session dies instantly, Pyrogram might complain. We consider this a success.
                 if "terminated" in str(e) or "Connection" in str(e):
                     await status_msg.edit("✅ **Session terminated successfully.**")
                 else:
                     raise e
             
         except AuthKeyUnregistered:
+            # This happens if the user already manually removed it from devices
             await status_msg.edit("⚠️ **Session was already invalid.** Cleaning local database...")
         except Exception as e:
+            # For any other real error, we just log it but still clean local DB
             print(f"Remote logout warning: {e}")
             await status_msg.edit("✅ **Local session cleared.** (Remote session might already be gone)")
         finally:
@@ -1187,6 +1040,7 @@ async def logout(client, message):
                     await user_client.disconnect()
             except: pass
 
+    # 3. Stop and remove live watcher client if running
     if user_id in USER_CLIENTS:
         try:
             await USER_CLIENTS[user_id].stop()
@@ -1194,6 +1048,7 @@ async def logout(client, message):
             pass
         del USER_CLIENTS[user_id]
 
+    # 4. Clean up Local Database
     await db.set_session(user_id, session=None)
     await db.set_api_id(user_id, api_id=None)
     await db.set_api_hash(user_id, api_hash=None)
@@ -1212,11 +1067,13 @@ async def login_handler(bot: Client, message: Message):
         return  
     user_id = int(message.from_user.id)
 
+    # --- Check Env Variables First ---
     if API_ID != 0 and API_HASH:
         await message.reply("**🔑 Specific API ID and HASH found in variables. Using them automatically...**")
         api_id = API_ID
         api_hash = API_HASH
     else:
+        # YouTube Link Removed Here
         api_id_msg = await bot.ask(user_id, "<b>Send Your API ID.</b>", filters=filters.text)
         if api_id_msg.text == '/cancel':
             return await api_id_msg.reply('<b>process cancelled !</b>')
@@ -1238,18 +1095,21 @@ async def login_handler(bot: Client, message: Message):
              await api_hash_msg.reply("**❌ Invalid API HASH**\n\nPlease start again with /login.", quote=True)
              return
 
+    # --- NEW STYLED TEXT ---
     login_text = (
         "🔐 **Login Process Initiated**\n\n"
         "Please send your **Phone Number** in international format.\n"
         "Example: `+1234567890`\n\n"
         "🛡️ *Your session is stored securely locally.*"
     )
+    # -----------------------
 
     phone_number_msg = await bot.ask(chat_id=user_id, text=login_text, filters=filters.text)
     if phone_number_msg.text=='/cancel':
         return await phone_number_msg.reply('<b>process cancelled !</b>')
     phone_number = phone_number_msg.text
     
+    # Connect for auth
     client_auth = Client(f"login_{user_id}_{int(time.time())}", api_id=api_id, api_hash=api_hash, in_memory=True)
     await client_auth.connect()
     
@@ -1298,6 +1158,7 @@ async def login_handler(bot: Client, message: Message):
     try:
         user_data = await db.get_session(message.from_user.id)
         if user_data is None:
+            # Verification check
             uclient = Client(f"verify_{message.from_user.id}_{int(time.time())}", session_string=string_session, api_id=api_id, api_hash=api_hash, in_memory=True)
             await uclient.connect()
             
@@ -1321,10 +1182,12 @@ async def broadcast_messages(user_id, message):
     start_time = time.time()
     try:
         await message.copy(chat_id=user_id)
+        # Calculates sleep based on work time
         elapsed = time.time() - start_time
         await asyncio.sleep(max(0, 1.5 - elapsed)) 
         return True, "Success"
     except FloodWait as e:
+        # If floodwait is huge, just skip this user to save the broadcast
         if e.value > 60:
             return False, "Error"
         await asyncio.sleep(e.value)
@@ -1387,17 +1250,21 @@ async def broadcast(bot, message):
 async def watch_setup(client: Client, message: Message):
     user_id = message.from_user.id
     
+    # Usage: /watch [LINK]
     if len(message.command) < 2:
         return await message.reply("**Usage:**\n`/watch https://t.me/channel/123`\n(Supports Topics too!)")
     
     link_text = message.command[1]
     
+    # 1. Analyze Link (Restriction & Topic)
     wait_msg = await message.reply("🔎 **Analyzing Source...**", quote=True)
     is_restricted, status_text = await check_link_restriction(user_id, link_text)
     
+    # Extract Source Topic (if any)
     source_thread_id = None
     if "t.me/c/" in link_text:
         parts = link_text.split("t.me/c/")[1].split("/")
+        # Changed to >= 2 to catch direct Topic Links (t.me/c/12345/5)
         if len(parts) >= 2 and parts[1].isdigit():
             source_thread_id = int(parts[1])
     elif "t.me/" in link_text:
@@ -1407,14 +1274,16 @@ async def watch_setup(client: Client, message: Message):
     
     await wait_msg.delete()
     
+    # 2. Save State
     PENDING_TASKS[user_id] = {
-        "mode": "WATCHER", 
+        "mode": "WATCHER", # <--- Important Flag
         "link": link_text,
         "source_thread_id": source_thread_id,
         "is_restricted": is_restricted,
         "status": "waiting_choice"
     }
     
+    # 3. Ask Destination
     buttons = [
         [InlineKeyboardButton("📂 Send to DM (Here)", callback_data="dest_dm")],
         [InlineKeyboardButton("📢 Send to Channel/Group", callback_data="dest_custom")],
@@ -1463,6 +1332,7 @@ async def list_watchers(client, message):
     cursor = await db.get_all_watchers()
     watchers = await cursor.to_list(length=100)
     
+    # Removed the ADMINS check so everyone only sees their own setups
     user_watchers = [w for w in watchers if w.get('user_id') == user_id]
     
     if not user_watchers:
@@ -1476,7 +1346,7 @@ async def list_watchers(client, message):
         if w.get('source_thread'): src_display += f" (Topic: {w['source_thread']})"
         
         targets = w.get('targets', [])
-        if not targets and 'dest_id' in w: 
+        if not targets and 'dest_id' in w: # Load Legacy Layout 
             targets = [{"dest_id": w['dest_id'], "dest_thread": w.get('dest_thread'), "dest_title": w.get('dest_title')}]
             
         text += f"**{idx}. 📥 {src_display}**\n"
@@ -1495,16 +1365,22 @@ async def list_watchers(client, message):
     
 @app.on_callback_query(filters.regex("^unwatch_"))
 async def unwatch_callback(client, query):
+    # --- HANDLER 1: CANCEL ALL ---
     if query.data == "unwatch_all":
         user_id = query.from_user.id
+        # Delete all watchers belonging to this user
         result = await db.db.watchers.delete_many({'user_id': user_id})
+        
+        # Edit message to show success (Closes menu)
         await query.message.edit(f"✅ **Success!**\n\n🗑 Removed `{result.deleted_count}` active watchers.")
         return
 
+    # --- HANDLER 2: CANCEL SPECIFIC ---
     data = query.data.split("_")
     source_id = int(data[1])
     topic_id = int(data[2])
     
+    # 1. Fetch details (Titles) BEFORE deleting, for the success message
     query_db = {'source_id': source_id}
     if topic_id != 0:
         query_db['source_thread'] = topic_id
@@ -1518,12 +1394,15 @@ async def unwatch_callback(client, query):
         src_name = watcher.get('source_title') or str(source_id)
         dest_name = watcher.get('dest_title') or str(watcher.get('dest_id'))
 
+    # 2. Delete from DB
     if topic_id == 0:
         await db.db.watchers.delete_many({'source_id': source_id, 'source_thread': None})
+        # Fallback for old format
         await db.db.watchers.delete_many({'source_id': source_id, 'source_thread': {'$exists': False}})
     else:
         await db.db.watchers.delete_many({'source_id': source_id, 'source_thread': topic_id})
         
+    # 3. Edit Message (This replaces the menu, effectively closing it)
     await query.message.edit(
         f"🗑 **Active Watcher Task Removed**\n\n"
         f"From: **{src_name}**\n"
@@ -1534,10 +1413,11 @@ async def unwatch_callback(client, query):
 # --- CORE: receive links / start tasks / processing / cancel checks ---
 # ==============================================================================
 
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log", "addsrc", "adddst", "delch", "channels", "sync", "pixel"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in PENDING_TASKS:
+        # (Keep existing setup logic for waiting_id / waiting_speed)
         if PENDING_TASKS[user_id].get("status") == "waiting_id":
             await process_custom_destination(client, message)
             return
@@ -1549,9 +1429,11 @@ async def save(client: Client, message: Message):
     if not link_text or "https://t.me/" not in link_text:
         return
 
+    # --- NEW: CHECK RESTRICTION FIRST ---
     wait_msg = await message.reply("🔎 **Analyzing Link...**", quote=True)
     is_restricted, status_text = await check_link_restriction(user_id, link_text)
     await wait_msg.delete()
+    # ------------------------------------
 
     PENDING_TASKS[user_id] = {
         "link": link_text, 
@@ -1565,6 +1447,7 @@ async def save(client: Client, message: Message):
         [InlineKeyboardButton("❌ Cancel Setup", callback_data="cancel_setup")]
     ]
     
+    # Add the status text to the reply
     await message.reply(
         f"✨ **Link Detected!**\n\n"
         f"{status_text}\n\n"
@@ -1578,12 +1461,14 @@ async def dl_handler(client: Client, message: Message):
     user_id = message.from_user.id
     link_text = ""
     
+    # 1. Extract Link (from Reply or Command Argument)
     reply = message.reply_to_message
     if reply and (reply.text or reply.caption):
         link_text = reply.text or reply.caption
     elif len(message.command) > 1:
         link_text = message.text.split(None, 1)[1]
         
+    # 2. Validate Link
     if not link_text or "https://t.me/" not in link_text:
         await message.reply_text(
             "**Usage:**\n"
@@ -1592,10 +1477,13 @@ async def dl_handler(client: Client, message: Message):
         )
         return
 
+    # --- NEW: CHECK RESTRICTION FIRST ---
     wait_msg = await message.reply("🔎 **Analyzing Link...**", quote=True)
     is_restricted, status_text = await check_link_restriction(user_id, link_text)
     await wait_msg.delete()
+    # ------------------------------------
 
+    # 3. Handle Group Chat (Directly ask for Speed)
     if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
         PENDING_TASKS[user_id] = {
             "link": link_text,
@@ -1603,12 +1491,15 @@ async def dl_handler(client: Client, message: Message):
             "dest_thread_id": message.message_thread_id,
             "dest_title": message.chat.title or "This Group",
             "status": "waiting_speed",
-            "is_restricted": is_restricted 
+            "is_restricted": is_restricted # <--- ADDED THIS
         }
+        # Send the status info before showing the speed menu
         await message.reply(f"✨ **Link Analyzed!**\n{status_text}", quote=True)
         await ask_for_speed(message)
         return
 
+    # 4. Handle Private Chat (Show Destination Menu)
+    # CHANGE: Added "is_restricted" here too
     PENDING_TASKS[user_id] = {
         "link": link_text, 
         "status": "waiting_choice",
@@ -1618,7 +1509,7 @@ async def dl_handler(client: Client, message: Message):
     buttons = [
         [InlineKeyboardButton("📂 Send to DM (Here)", callback_data="dest_dm")],
         [InlineKeyboardButton("📢 Send to Channel/Group", callback_data="dest_custom")],
-        [InlineKeyboardButton("❌ Cancel Setup", callback_data="cancel_setup")]  
+        [InlineKeyboardButton("❌ Cancel Setup", callback_data="cancel_setup")]  # <-- Added this button
     ]
     
     await message.reply(
@@ -1674,7 +1565,7 @@ async def show_filter_menu(message_or_query, user_id):
     if not task_data: return
     
     if "allowed_types" not in task_data:
-        task_data["allowed_types"] = ["Video", "Document"] 
+        task_data["allowed_types"] = ["Video", "Document"] # Default strict settings!
     task_data["status"] = "waiting_filter"
     
     kb = get_filter_keyboard(task_data["allowed_types"])
@@ -1725,7 +1616,7 @@ async def filter_start_cb(client, query):
     allowed_types = task_data.get("allowed_types", ["Video", "Document"])
     
     if not allowed_types: 
-        PENDING_TASKS[user_id] = task_data 
+        PENDING_TASKS[user_id] = task_data # put back
         return await query.answer("❌ Select at least one type!", show_alert=True)
         
     delay = task_data.get("delay", 3)
@@ -1746,6 +1637,7 @@ async def process_custom_destination(client: Client, message: Message):
         dest_chat_id = None
         dest_thread_id = None
         
+        # Parse Links & IDs
         if "t.me/c/" in text:
             parts = text.split("t.me/c/")[1].split("/")
             dest_chat_id = int("-100" + parts[0])
@@ -1753,7 +1645,7 @@ async def process_custom_destination(client: Client, message: Message):
                 dest_thread_id = int(parts[1])
         elif "t.me/" in text:
             parts = text.split("t.me/")[1].split("/")
-            dest_chat_id = parts[0] 
+            dest_chat_id = parts[0] # username
             if len(parts) > 1 and parts[1].isdigit():
                 dest_thread_id = int(parts[1])
         elif "/" in text:
@@ -1766,8 +1658,9 @@ async def process_custom_destination(client: Client, message: Message):
         try:
             chat = await client.get_chat(dest_chat_id)
             title = chat.title or "Target Chat"
-            dest_chat_id = chat.id 
+            dest_chat_id = chat.id # Force conversion to proper strict ID
             
+            # Prevent bot from endlessly replying if the chat isn't a Forum Topic
             if not getattr(chat, "is_forum", False):
                 dest_thread_id = None
                 
@@ -1775,6 +1668,7 @@ async def process_custom_destination(client: Client, message: Message):
             await message.reply(f"❌ **Invalid Chat ID/Link** or I am not an admin there.\nError: `{e}`")
             return
             
+        # --- DESTINATION ACCESS TEST ---
         wait_msg = await message.reply("🔄 **Testing destination access...**", quote=True)
         success, error_msg = await test_destination_access(client, dest_chat_id, dest_thread_id)
         
@@ -1783,6 +1677,7 @@ async def process_custom_destination(client: Client, message: Message):
             return
             
         await wait_msg.delete()
+        # -------------------------------
             
         PENDING_TASKS[user_id]["dest_chat_id"] = dest_chat_id
         PENDING_TASKS[user_id]["dest_thread_id"] = dest_thread_id
@@ -1823,6 +1718,7 @@ async def speed_callback(client: Client, query):
         )
         return
 
+    # Default Speed selected
     if choice == "speed_default":
         PENDING_TASKS[user_id]["delay"] = 0 if task_data.get("mode") == "WATCHER" else 3
         await show_filter_menu(query, user_id)
@@ -1841,11 +1737,12 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
     if user_id is None:
         user_id = message.from_user.id if message.from_user else None
     if not user_id:
-        return 
+        return  # Can't proceed without a user_id
     src_link = data['link']
     source_id = None
     source_title = "Unknown Source"
     
+    # 1. CHECK SESSION
     user_session = await db.get_session(user_id)
     api_id = await db.get_api_id(user_id)
     api_hash = await db.get_api_hash(user_id)
@@ -1853,6 +1750,7 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
     if not user_session:
         return await message.reply("❌ **You are not logged in.**\n\nWatcher mode requires your account to 'listen' for new messages.\nPlease /login first.")
 
+    # 2. START CLIENT ON-DEMAND (If not already running)
     if user_id not in USER_CLIENTS:
         status_msg = await message.reply("🔄 **Starting your Listener Client...**")
         try:
@@ -1865,9 +1763,10 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
                 api_id=u_api, 
                 api_hash=u_hash, 
                 workers=4, 
-                ipv6=False,
-                in_memory=True # Memory Fix
+                ipv6=False
+                # Removed in_memory=True so Pyrogram tracks the update state physically
             )
+            # Important: Add the handler without filters to ensure Pyrogram catches ALL channel updates!
             new_client.add_handler(MessageHandler(user_watcher_handler))
             
             await new_client.start()
@@ -1877,10 +1776,12 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
         except Exception as e:
             return await status_msg.edit(f"❌ **Session Error:** `{e}`\n\nTry /logout and /login again.")
 
+    # 3. VERIFY LINK (Using the now-running client)
     user_client = USER_CLIENTS[user_id]
     try:
         join_target = None
         if "t.me/c/" in src_link:
+            # Private Link Logic
             chat_str = src_link.split("t.me/c/")[1].split("/")[0]
             source_id = int("-100" + chat_str)
             join_target = source_id
@@ -1890,19 +1791,23 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
             except:
                 source_title = str(source_id)
         else:
+            # Public Link Logic
+            # Extract clean username (e.g. getfileshere5)
             username = src_link.replace("https://", "").replace("http://", "").replace("t.me/", "").split("/")[0]
             chat = await user_client.get_chat(username)
             source_id = chat.id
             source_title = chat.title or str(source_id)
-            join_target = username 
+            join_target = username # Use username to join public chats!
             
+        # --- AGGRESSIVE AUTO-JOIN & VERIFICATION ---
         try: 
             await user_client.join_chat(join_target)
         except UserAlreadyParticipant:
-            pass 
+            pass # All good!
         except Exception as e:
             print(f"⚠️ Auto-join warning for {join_target}: {e}")
             
+        # Telegram WILL NOT send live updates if the account isn't a member. Force a check.
         try:
             await user_client.get_chat_member(source_id, "me")
         except Exception:
@@ -1913,11 +1818,14 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
 
     dest_chat_id = data.get('dest_chat_id')
     
-    if dest_chat_id and dest_chat_id != user_id: 
+    # --- DESTINATION ACCESS TEST ---
+    if dest_chat_id and dest_chat_id != user_id:  # Skip test if sending to DM
         success, error_msg = await test_destination_access(app, dest_chat_id, data.get('dest_thread_id'))
         if not success:
             return await message.reply(f"❌ **Watcher Setup Failed!**\nCannot write to the target destination.\n**Error:** `{error_msg}`")
+    # -------------------------------
 
+    # 4. SAVE TO DB
     await db.add_watcher(
         user_id=user_id,
         source_id=source_id,
@@ -1931,6 +1839,7 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
         allowed_types=data.get('allowed_types')
     )
     
+    # 5. REPLY WITH YOUR EXACT FORMAT
     await message.reply(
         f"✅ **Watcher/Routing Active!**\n\n"
         f"👀 Source: `{source_title}`\n"
@@ -1941,14 +1850,20 @@ async def finalize_watcher_setup(client, message, data, delay, user_id=None):
         f"🔒 Restricted Mode: `{'Yes' if data['is_restricted'] else 'No'}`\n"
         f"🎛 Filter: `{', '.join(data.get('allowed_types', []))}`"
     )
+    
+# ==============================================================================
+# --- NEW ROBUSTNESS HELPERS ---
+# ==============================================================================
 
 async def send_log(text):
+    """Sends errors/alerts to the Configured Log Channel/Topic"""
     if not LOG_CHANNEL:
         return
     try:
         chat_id = LOG_CHANNEL
         topic_id = None
         
+        # Check if "ID/TOPIC" format
         if "/" in LOG_CHANNEL:
             parts = LOG_CHANNEL.split("/")
             chat_id = int(parts[0])
@@ -1961,23 +1876,26 @@ async def send_log(text):
         print(f"❌ Failed to send log: {e}")
 
 async def check_disk_space():
+    """Returns False if free space is < 500MB"""
     try:
         total, used, free = shutil.disk_usage(".")
         free_mb = free / (1024 * 1024)
-        if free_mb < 500: 
+        if free_mb < 500: # Limit: 500MB
             return False
         return True
     except:
         return True
 
 async def cleanup_watchdog():
+    """Runs every 10 mins to clean stuck download folders older than 2 hours"""
     while True:
-        await asyncio.sleep(600) 
+        await asyncio.sleep(600) # Check every 10 mins
         try:
             download_path = Path("./downloads")
             if not download_path.exists(): continue
             
             current_time = time.time()
+            # 2 hours in seconds
             max_age = 2 * 60 * 60 
             
             for user_folder in download_path.iterdir():
@@ -1992,6 +1910,7 @@ async def cleanup_watchdog():
             print(f"Watchdog Error: {e}")
             
 async def start_task_final(client: Client, message_context: Message, task_data: dict, delay: int, user_id: int):
+    # 1. DISK SPACE PRE-CHECK
     if not await check_disk_space():
         msg = "⚠️ **Server Busy:** Disk is almost full. Please wait for other tasks to finish."
         if isinstance(message_context, Message):
@@ -1999,6 +1918,8 @@ async def start_task_final(client: Client, message_context: Message, task_data: 
         await send_log("🚨 **Critical:** Disk Space Low (Under 500MB). Tasks rejected.")
         return
 
+    # 2. QUEUE SYSTEM
+    # If user has hit their limit (e.g., 2 tasks), queue this one.
     if user_id not in ADMINS and batch_temp.ACTIVE_TASKS[user_id] >= MAX_CONCURRENT_TASKS_PER_USER:
         TASK_QUEUE[user_id].append({
             "client": client,
@@ -2010,10 +1931,12 @@ async def start_task_final(client: Client, message_context: Message, task_data: 
         await message_context.reply(f"⏳ **Added to Queue:** Position #{position}\nTask will start automatically when your current tasks finish.", quote=True)
         return
 
+    # 3. START TASK (Standard Logic)
     task_uuid = uuid.uuid4().hex
     dest = task_data.get("dest_title", "Direct Message")
     
     batch_temp.ACTIVE_TASKS[user_id] += 1
+    # IS_BATCH removed — no longer needed
 
     start_msg = f"✅ **Task Started!**\nDestination: `{dest}`\nSpeed: `{delay}s` delay\nTask ID: `{task_uuid[:8]}`"
     try:
@@ -2024,17 +1947,19 @@ async def start_task_final(client: Client, message_context: Message, task_data: 
                 await message_context.reply(start_msg)
     except: pass
     
+    # Log to Channel
     await send_log(f"▶️ **Task Started**\nUser: `{user_id}`\nLink: `{task_data['link'][:40]}...`")
 
     if user_id not in ACTIVE_PROCESSES:
         ACTIVE_PROCESSES[user_id] = {}
     ACTIVE_PROCESSES[user_id][task_uuid] = {
         "user": task_data.get("dest_title", f"User({user_id})"),
-        "dest_title_name": task_data.get("dest_title", "Direct Message"), 
+        "dest_title_name": task_data.get("dest_title", "Direct Message"), # Add this
         "item": task_data.get("link", "Unknown"),
         "started": time.time()
     }
     
+    # CHANGE: Get the flag we saved earlier
     is_restricted = task_data.get("is_restricted", False)
 
     targets = [{"dest_id": task_data.get("dest_chat_id"), "dest_thread": task_data.get("dest_thread_id"), "dest_title": dest}]
@@ -2053,7 +1978,9 @@ async def start_task_final(client: Client, message_context: Message, task_data: 
         )
     )   
     
+# CHANGE: Upgraded to multi-target & filter logic
 async def process_links_logic(client: Client, message: Message, text: str, targets=None, dest_title="Direct Message", delay=3, acc_user_id=None, task_uuid=None, is_restricted=False, allowed_types=None):
+    # --- 1. SETUP USER & LOGGING ---
     user_id = acc_user_id or (message.from_user.id if message.from_user else 0)
     user_mention = message.from_user.mention if message.from_user else f"User({user_id})"
     
@@ -2067,14 +1994,15 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
         "started": time.time()
     }
 
+    # --- 2. BATCH PROCESSING ---
     if "https://t.me/" in text:
         acc = None
-        is_temp_client = False 
+        is_temp_client = False  # <--- ADD THIS HERE
         success_count = 0
         failed_count = 0
         total_count = 0
         status_message = None
-        filter_thread_id = None 
+        filter_thread_id = None # Store the Topic ID here
         
         start_time = time.time()
         source_title = "Unknown Source"
@@ -2084,9 +2012,22 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             clean_text = text.replace("https://", "").replace("http://", "").replace("t.me/", "").replace("c/", "")
             parts = clean_text.split("/")
 
+            # --- DETECT SOURCE TOPIC ID ---
+            # If link is format: chat_id/topic_id/msg_id
             if len(parts) >= 3 and parts[1].isdigit(): 
                 filter_thread_id = int(parts[1])
 
+            # Parse range
+            last_segment = parts[-1].strip()
+            range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
+            if range_match:
+                fromID, toID = int(range_match.group(1)), int(range_match.group(2))
+            else:
+                fromID = toID = int(last_segment)
+
+            total_count = max(1, toID - fromID + 1)
+
+            # Session login
             user_data = await db.get_session(user_id)
             if not user_data:
                 await message.reply("**/login First.**")
@@ -2095,6 +2036,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             api_id = await db.get_api_id(user_id)
             api_hash = await db.get_api_hash(user_id)
             
+            # Reuse existing client if running (Watcher), otherwise create temp
             is_temp_client = False
             if user_id in USER_CLIENTS and USER_CLIENTS[user_id].is_connected:
                 acc = USER_CLIENTS[user_id]
@@ -2108,70 +2050,20 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                     workers=4,
                     sleep_threshold=60,
                     ipv6=False,
-                    in_memory=True # Memory Fix
+                    in_memory=True
                 )
                 await acc.start()
                 is_temp_client = True
-
-            try: chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
-            except Exception: chatid_check = parts[0]
-
-            last_segment = parts[-1].strip()
-            range_match = re.search(r"(\d+)\s*-\s*([a-zA-Z0-9]+)", text)
-            
-            if range_match:
-                fromID = int(range_match.group(1))
-                end_str = range_match.group(2).lower()
-                
-                if end_str == "all":
-                    try:
-                        async for last_msg in acc.get_chat_history(chatid_check, limit=1):
-                            toID = last_msg.id
-                    except Exception as e:
-                        print(f"Failed to fetch last message for ALL: {e}")
-                        toID = fromID
-                else:
-                    try: toID = int(end_str)
-                    except: toID = fromID
-            else:
-                fromID = toID = int(last_segment)
-
-            if fromID == toID:
-                try:
-                    media_group = await acc.get_media_group(chatid_check, fromID)
-                    if media_group and len(media_group) > 1:
-                        ids = [m.id for m in media_group]
-                        fromID = min(ids)
-                        toID = max(ids)
-                except Exception:
-                    pass
-
-            primary_dest = targets[0]['dest_id'] if targets else "unknown_dest"
-            saved_msg_id = await db.get_sync_progress(user_id, chatid_check, primary_dest)
-
-            if saved_msg_id >= toID:
-                skip_msg = (f"⏭ **DUPLICATE SKIPPED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n✅ **Status:** Files up to ID `{toID}` are already synced.")
-                try: await client.send_message(message.chat.id, skip_msg, reply_to_message_id=message.id)
-                except: pass
-                if task_uuid in ACTIVE_PROCESSES.get(user_id, {}): del ACTIVE_PROCESSES[user_id][task_uuid]
-                if is_temp_client: await acc.stop()
-                return
-                
-            elif saved_msg_id >= fromID and saved_msg_id < toID:
-                fromID = saved_msg_id + 1
-                resume_msg = (f"♻️ **AUTO-RESUME ACTIVATED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n▶️ **Resuming From ID:** `{fromID}`")
-                try: await client.send_message(message.chat.id, resume_msg, reply_to_message_id=message.id)
-                except: pass
-
-            total_count = max(1, toID - fromID + 1)
             
             try:
+                chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
                 source_chat = await acc.get_chat(chatid_check)
                 source_title = source_chat.title or "Private Chat"
             except: pass
 
             ACTIVE_PROCESSES[user_id][task_uuid].update({"source_title": source_title, "total": total_count, "current": 0})
 
+            # --- STATUS MESSAGE SETUP ---
             status_text_header = f"**Batch Task Started!** 🚀\n"
             if filter_thread_id:
                 status_text_header += f"**Filter:** `Topic {filter_thread_id} Only` 🎯\n"
@@ -2192,6 +2084,8 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 )
 
             last_update_time = time.time()
+            
+            # Prepare header text for inner status
             inner_header = f"Filter: Topic {filter_thread_id} Only 🎯" if filter_thread_id else ""
 
             for index, msgid in enumerate(range(fromID, toID+1), start=1):
@@ -2205,10 +2099,10 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
 
                 is_success = False
                 try:
-                    chat_id = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
+                    chatid = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
                     
                     is_success = await handle_private(
-                        client, acc, message, chat_id, msgid, index, total_count, 
+                        client, acc, message, chatid, msgid, index, total_count, 
                         status_message, targets, delay, 
                         user_id, task_uuid, 
                         is_restricted=is_restricted, 
@@ -2237,19 +2131,18 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 if is_success: success_count += 1
                 else: failed_count += 1
 
+                # --- 3. UNIVERSAL SMART SLEEP ---
                 if index < total_count:
                     if is_success:
+                        # Success: Wait delay
                         elapsed_time = time.time() - loop_start_time
                         actual_sleep = max(0, delay - elapsed_time)
                         await asyncio.sleep(actual_sleep)
                     else:
+                        # Failed/Skipped (Wrong Topic): Skip FAST (0.05s)
                         await asyncio.sleep(0.05)
-                        
-                if index % 100 == 0:
-                    gc.collect()
 
-                if not was_cancelled: await db.save_sync_progress(user_id, chatid_check, primary_dest, msgid)
-
+                # --- UPDATE DASHBOARD ---
                 if not is_restricted:
                     current_now = time.time()
                     if (index % 20 == 0) or (current_now - last_update_time >= 60) or index == total_count:
@@ -2275,6 +2168,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 try: del ACTIVE_PROCESSES[user_id][task_uuid]
                 except: pass
             
+            # Clean up cancel flag so it never bleeds into any future task
             CANCEL_FLAGS.pop(task_uuid, None)
 
             batch_temp.ACTIVE_TASKS[user_id] -= 1
@@ -2286,9 +2180,10 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                     asyncio.create_task(start_task_final(next_item["client"], next_item["message"], next_item["data"], next_item["delay"], user_id))
                 except Exception as e:
                     print(f"❌ Queue Execution Failed for {user_id}: {e}")
+                    # Force the queue to keep moving if a task dies instantly
                     batch_temp.ACTIVE_TASKS[user_id] -= 1 
 
-            if acc and is_temp_client: 
+            if acc and is_temp_client:  # <--- ONLY STOP IF TEMP
                 try: await acc.stop()
                 except: pass
 
@@ -2315,6 +2210,10 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             try: await status_message.delete()
             except: pass
 
+# ==============================================================================
+# --- handle_private: downloads & uploads with per-task cancel checks ---
+# ==============================================================================
+
 async def handle_private(client: Client, acc, message: Message, chatid, msgid: int, index: int, total_count: int, status_message: Message, targets: list, delay, user_id, task_uuid=None, is_restricted=False, header_text="", filter_thread_id=None, allowed_types=None):
     if not task_uuid:
         task_uuid = "default"
@@ -2327,6 +2226,7 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
 
     if not msg or msg.empty: return False
     
+    # --- TOPIC FILTER CHECK ---
     if filter_thread_id is not None:
         if getattr(msg, "message_thread_id", None) != filter_thread_id:
             return False
@@ -2334,11 +2234,13 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
     msg_type = get_message_type(msg)
     if not msg_type: return False
 
+    # --- CONTENT FILTER CHECK ---
     if allowed_types is not None and msg_type not in allowed_types:
         return False
 
     if task_uuid and CANCEL_FLAGS.get(task_uuid): return False
 
+    # --- CLEAR OLD STATUS ---
     try:
         if status_message:
             m_id = status_message.id
@@ -2346,36 +2248,28 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             if f"{m_id}:up" in PROGRESS: del PROGRESS[f"{m_id}:up"]
     except Exception: pass
 
-    original_filename = "unknown_file"
-    if msg.document and msg.document.file_name: original_filename = msg.document.file_name
-    elif msg.video and msg.video.file_name: original_filename = msg.video.file_name
-    elif msg.audio and msg.audio.file_name: original_filename = msg.audio.file_name
-    elif msg_type == "Photo": original_filename = f"{msgid}.jpg"
-    elif msg_type == "Voice": original_filename = f"{msgid}.ogg"
-
-    perfect_caption, perfect_filename = smart_rename(original_filename, msg.caption.html if msg.caption else "")
-    clean_caption = f"<b>{perfect_caption}</b>"
-
+    # 1. FAST FORWARD (Copy to Multiple Targets)
     if not is_restricted and not getattr(msg, "has_protected_content", False) and not getattr(msg.chat, "has_protected_content", False):
         forward_success = False
         for dest in targets:
             dest_chat_id = dest['dest_id']
             dest_thread_id = dest.get('dest_thread')
             try:
-                await client.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
+                await client.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
                 forward_success = True
             except Exception:
                 try:
-                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
+                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
                     forward_success = True
                 except FloodWait as e:
                     if e.value > 300: raise e
                     await asyncio.sleep(e.value + 2)
-                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
+                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
                     forward_success = True
                 except Exception as e:
                     print(f"Task Fast-Copy blocked: {e}")
         if forward_success: return True
+        # NOTE: 'return False' removed so it can drop down to download mode
 
     if "Text" == msg_type:
         for dest in targets:
@@ -2384,19 +2278,29 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             except: pass
         return True
 
+    # 2. PATHS & FILENAME
     task_folder_path = Path(f"./downloads/{user_id}/{task_uuid}/{msgid}/")
     task_folder_path.mkdir(parents=True, exist_ok=True)
 
-    safe_filename = sanitize_filename(perfect_filename)
+    original_filename = "unknown_file"
+    if msg.document and msg.document.file_name: original_filename = msg.document.file_name
+    elif msg.video and msg.video.file_name: original_filename = msg.video.file_name
+    elif msg.audio and msg.audio.file_name: original_filename = msg.audio.file_name
+    elif msg_type == "Photo": original_filename = f"{msgid}.jpg"
+    elif msg_type == "Voice": original_filename = f"{msgid}.ogg"
+
+    safe_filename = sanitize_filename(original_filename)
     if not safe_filename.strip(): safe_filename = f"{msgid}.dat"
     file_path_to_save = task_folder_path / safe_filename
 
+    # 3. START DOWNLOAD
     chat_for_status = status_message.chat.id if status_message else message.chat.id
     down_task = asyncio.create_task(downstatus(client, status_message, chat_for_status, index, total_count, header_text))
     file_path = None
     ph_path = None
     download_success = False
 
+    # Forced to 2GB because Bots cannot upload files larger than 2GB via MTProto
     split_limit = 2000 * 1024 * 1024 
 
     try: 
@@ -2420,7 +2324,9 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                     
                     if f"{status_message.id}:up" in PROGRESS: del PROGRESS[f"{status_message.id}:up"]
                     up_task = asyncio.create_task(upstatus(client, status_message, chat_for_status, index, total_count, header_text))
+                    caption = msg.caption.html if msg.caption else ""
                     
+                    # Split Multi-Upload
                     async with USER_SEMAPHORES[user_id]:
                         async with SERVER_UPLOAD_LIMIT:
                             for part in parts:
@@ -2429,16 +2335,16 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                                     dest_chat_id = dest['dest_id']
                                     dest_thread_id = dest.get('dest_thread')
                                     retry_part = 0
-                                    while retry_part < 5: 
+                                    while retry_part < 5: # Fight through network blips!
                                         try:
                                             await client.send_document(
                                                 dest_chat_id, 
                                                 str(part), 
-                                                caption=clean_caption, 
+                                                caption=caption, 
                                                 parse_mode=enums.ParseMode.HTML, 
                                                 reply_to_message_id=dest_thread_id,
-                                                progress=progress, 
-                                                progress_args=[status_message, "up", task_uuid]
+                                                progress=progress,  # <--- ADDED
+                                                progress_args=[status_message, "up", task_uuid] # <--- ADDED
                                             )
                                             break
                                         except FloodWait as e: 
@@ -2487,7 +2393,11 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
         if f"{status_message.id}:up" in PROGRESS: del PROGRESS[f"{status_message.id}:up"]
         up_task = asyncio.create_task(upstatus(client, status_message, chat_for_status, index, total_count, header_text))
         
+        caption = msg.caption.html if msg.caption else ""
+        
+        # CHANGED: Hand the upload over to the Bot to bypass User Bandwidth limits!
         uploader = client 
+
         upload_success = False
         
         async def upload_to_dest(dest):
@@ -2497,15 +2407,15 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             async with SERVER_UPLOAD_LIMIT:
                 async with USER_SEMAPHORES[user_id]:
                     retry_count = 0
-                    while retry_count < 5: 
+                    while retry_count < 5: # Fight through network blips!
                         if task_uuid and CANCEL_FLAGS.get(task_uuid): break
                         try:
-                            if "Document" == msg_type: await uploader.send_document(dest_chat_id, file_path, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Video" == msg_type: await uploader.send_video(dest_chat_id, file_path, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Audio" == msg_type: await uploader.send_audio(dest_chat_id, file_path, thumb=ph_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Photo" == msg_type: await uploader.send_photo(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
-                            elif "Voice" == msg_type: await uploader.send_voice(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
-                            elif "Animation" == msg_type: await uploader.send_animation(dest_chat_id, file_path, caption=clean_caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
+                            if "Document" == msg_type: await uploader.send_document(dest_chat_id, file_path, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Video" == msg_type: await uploader.send_video(dest_chat_id, file_path, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Audio" == msg_type: await uploader.send_audio(dest_chat_id, file_path, thumb=ph_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Photo" == msg_type: await uploader.send_photo(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
+                            elif "Voice" == msg_type: await uploader.send_voice(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
+                            elif "Animation" == msg_type: await uploader.send_animation(dest_chat_id, file_path, caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=dest_thread_id)
                             elif "Sticker" == msg_type: await uploader.send_sticker(dest_chat_id, file_path, reply_to_message_id=dest_thread_id)
                             success_local = True
                             break 
@@ -2517,6 +2427,7 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                             await asyncio.sleep(3)
             return success_local
 
+        # Execute loop for Multi-Target
         for dest in targets:
             if task_uuid and CANCEL_FLAGS.get(task_uuid): break
             if await upload_to_dest(dest):
@@ -2528,7 +2439,11 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
     finally:
         try: await asyncio.to_thread(shutil.rmtree, task_folder_path, ignore_errors=True)
         except: pass
+        gc.collect()
 
+# ==============================================================================
+# --- Koyeb health check (optional) ---
+# ==============================================================================
 try:
     from aiohttp import web
 except ImportError:
@@ -2554,115 +2469,134 @@ async def start_koyeb_health_check(host: str = "0.0.0.0", port: int | str = 8080
     await site.start()
     print(f"Starting Koyeb health check server on port {port}...")
 
+# ==============================================================================
+# --- LIVE WATCHER ENGINE ---
+# ==============================================================================
+
 from pyrogram.handlers import MessageHandler
 
-WATCHER_LOCKS = {} 
+WATCHER_LOCKS = {} # Stores queues for live watchers
 
 async def process_watcher_message(client, message):
     chat_id = message.chat.id
     topic_id = getattr(message, "message_thread_id", None)
     
+    print(f"🔍 [DEBUG WATCHER] Caught a message! ID: {message.id} | Chat: {chat_id} | Topic: {topic_id}")
+    
+    # 1. Find Watcher in DB
     watcher = await db.get_watcher(chat_id, topic_id)
     if not watcher:
         watcher = await db.get_watcher(chat_id, None)
         
     if not watcher: 
+        print(f"❌ [DEBUG WATCHER] Ignored: No DB entry for {chat_id}")
         return
 
+    print(f"✅ [DEBUG WATCHER] DB Match Found for {chat_id}! Checking filters...")
+
+    # 2. Extract Config & Validate Types
     targets = watcher.get('targets', [])
     if not targets and 'dest_id' in watcher:
         targets = [{"dest_id": watcher['dest_id'], "dest_thread": watcher.get('dest_thread'), "dest_title": watcher.get('dest_title')}]
         
     if not targets: 
+        print("❌ [DEBUG WATCHER] Ignored: No targets configured.")
         return
 
     allowed_types = watcher.get('allowed_types', ["Video", "Document"])
     msg_type = get_message_type(message)
     
+    print(f"⚙️ [DEBUG WATCHER] Message Type: {msg_type} | Allowed: {allowed_types}")
+    
     if msg_type not in allowed_types: 
+        print("❌ [DEBUG WATCHER] Ignored: Message type not in allowed list.")
         return
 
     delay = watcher.get('delay', 0)
     owner_id = watcher['user_id']
     is_restricted = watcher.get('is_restricted', False)
 
+    print(f"⏳ [DEBUG WATCHER] Proceeding with routing. Delay: {delay}s | Restricted: {is_restricted}")
+
+    # --- SEQUENTIAL QUEUE LOCK FOR THIS SOURCE ---
     lock_key = f"watcher_{chat_id}_{owner_id}"
     if lock_key not in WATCHER_LOCKS:
         WATCHER_LOCKS[lock_key] = asyncio.Lock()
 
+    # The lock forces 100 simultaneous messages to wait in a single-file line!
     async with WATCHER_LOCKS[lock_key]:
+        # 3. Wait Delay BETWEEN forwards
         if delay > 0:
             await asyncio.sleep(delay)
 
         is_content_protected = getattr(message, "has_protected_content", False) or getattr(message.chat, "has_protected_content", False)
         
-        fallback_to_download = True 
-
-        # --- 🧠 WATCHER FAST-FORWARD FIX (User Priority) ---
+        # --- MODE A: FAST COPY TO ALL (If Unrestricted) ---
         if not is_restricted and not is_content_protected:
             fallback_to_download = False
+            
+            # Use username if available so the Bot can access public channels it hasn't joined
             safe_source_id = message.chat.username if message.chat.username else chat_id
             
-            original_filename = "unknown_file"
-            if message.document and message.document.file_name: original_filename = message.document.file_name
-            elif message.video and message.video.file_name: original_filename = message.video.file_name
-            
-            caption_text = message.caption if message.caption else ""
-            perfect_caption, _ = smart_rename(original_filename, caption_text)
-            clean_caption = f"<b>{perfect_caption}</b>"
-
-            owner_client = USER_CLIENTS.get(owner_id)
-
             for t in targets:
                 success = False
                 dest_id = t['dest_id']
                 dest_thread = t.get('dest_thread')
                 
-                # TRY 1: Try copying using the User Session (Crucial for Private Channels)
-                if owner_client:
+                print(f"🚀 [DEBUG WATCHER] MODE A: Attempting Fast-Copy to {dest_id}")
+                
+                try: 
+                    # OPTION 1: Try Bot First 
+                    await app.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread)
+                    success = True
+                    print("✅ [DEBUG WATCHER] Bot Fast-Copy SUCCESS!")
+                except Exception as e1: 
+                    print(f"⚠️ [DEBUG WATCHER] Bot Fast-Copy failed: {e1}. Trying Userbot Fallback...")
                     try:
-                        await owner_client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
-                        success = True
-                        continue
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value + 2)
-                        await owner_client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
-                        success = True
-                        continue
+                        # Refresh Userbot's blank memory so it doesn't get PeerIdInvalid
+                        await client.get_chat(dest_id)
                     except Exception:
-                        pass # Fallback to bot
+                        pass
 
-                # TRY 2: Fallback to Bot copying
-                if not success:
                     try: 
-                        await app.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
+                        # OPTION 2: Try User Fallback (Copy)
+                        await client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread)
                         success = True
-                    except Exception:
+                        print("✅ [DEBUG WATCHER] Userbot Copy SUCCESS!")
+                    except Exception as e2:
+                        print(f"⚠️ [DEBUG WATCHER] Userbot Copy failed: {e2}. Trying Userbot Forward...")
                         try:
-                            await client.get_chat(dest_id)
-                        except Exception:
-                            pass
-                        try: 
-                            await client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
+                            # OPTION 3: Try User Fallback (Forward)
+                            await client.forward_messages(chat_id=dest_id, from_chat_id=chat_id, message_ids=message.id, message_thread_id=dest_thread)
                             success = True
-                        except Exception as e2:
+                            print("✅ [DEBUG WATCHER] Userbot Forward SUCCESS!")
+                        except Exception as e3:
+                            # Send failure reason to LOG_CHANNEL so it never fails silently again
+                            print(f"❌ [DEBUG WATCHER] ALL FAST-COPIES FAILED! Final Error: {e3}")
                             if LOG_CHANNEL:
                                 try:
                                     log_chat = int(LOG_CHANNEL.split("/")[0]) if "/" in LOG_CHANNEL else int(LOG_CHANNEL)
-                                    await app.send_message(log_chat, f"❌ **Fast-Copy Failed (Both User & Bot)!**\nSource: `{chat_id}`\nError: `{e2}`")
+                                    await app.send_message(log_chat, f"❌ **Fast-Copy Failed!**\nSource: `{chat_id}`\nDest: `{dest_id}`\nError: `{e3}`")
                                 except: pass
                 
+                # If all failed, flag it to use Download mode!
                 if not success:
+                    print("🔄 [DEBUG WATCHER] Falling back to Mode B (Download/Upload)")
                     fallback_to_download = True
 
-        if not fallback_to_download:
-            return 
+            # If fast copy worked perfectly, we are done!
+            if not fallback_to_download:
+                return 
                 
+        # --- MODE B: DOWNLOAD ONCE & UPLOAD TO ALL (Using Session) ---
+        print("📥 [DEBUG WATCHER] MODE B: Entering Download/Upload Mode...")
         owner_client = USER_CLIENTS.get(owner_id)
         if not owner_client: 
+            print("❌ [DEBUG WATCHER] Owner client not found in memory!")
             return 
 
         try:
+            # Always notify the User so they aren't left in the dark
             dummy_status = await app.send_message(owner_id, f"⬇️ **Watcher:** Processing ID `{message.id}` (Download Mode)...")
             
             if LOG_CHANNEL:
@@ -2678,6 +2612,7 @@ async def process_watcher_message(client, message):
                 except Exception:
                     pass
 
+            # Register Watcher as an Active Task so it can be monitored/cancelled!
             task_uuid = uuid.uuid4().hex
             if owner_id not in ACTIVE_PROCESSES: 
                 ACTIVE_PROCESSES[owner_id] = {}
@@ -2706,16 +2641,23 @@ async def process_watcher_message(client, message):
                     allowed_types=allowed_types
                 )
             finally:
+                # Clean up the task from tracking when finished or cancelled
                 if task_uuid in ACTIVE_PROCESSES.get(owner_id, {}):
                     del ACTIVE_PROCESSES[owner_id][task_uuid]
                 CANCEL_FLAGS.pop(task_uuid, None)
                 
             await dummy_status.delete()
+            print("✅ [DEBUG WATCHER] Download/Upload Mode COMPLETE!")
         except Exception as e:
             print(f"❌ [DEBUG WATCHER] Watcher Mode B Fail: {e}")
             
 async def user_watcher_handler(client, message):
+    # This runs when User Session receives a message
     await process_watcher_message(client, message)
+
+# ==============================================================================
+# --- MAIN ENTRY POINT ---
+# ==============================================================================
 
 async def cleanup_startup():
     folder = Path("./downloads")
@@ -2730,41 +2672,45 @@ async def cleanup_startup():
 async def main():
     global USER_CLIENTS
     
+    # 1. Cleanup
     await cleanup_startup()
     asyncio.create_task(cleanup_watchdog())
+    print("🛡️ Auto-Cleanup Watchdog Started")
 
+    # 2. Start Bot
     await app.start()
     print("🤖 Bot Started")
     
-    # 🇬🇧 + 🇮🇳 HYBRID AUTO-COMMANDS BUILDER
+    # --- AUTO-UPDATE COMMANDS (SCOPED) ---
+    print("📝 Updating Bot Commands...")
     try:
+        # A. Define the Public Commands (For Everyone)
         public_commands = [
-            BotCommand("start", "Commence the apparatus (Bot chalu karein)"),
-            BotCommand("help", "Peruse the authoritative directives (Guide dekhein)"),
-            BotCommand("login", "Authenticate cryptographic session (Account login karein)"),
-            BotCommand("logout", "Sever the connection (Account logout karein)"),
-            BotCommand("dl", "Instigate extraction of asset (Link se file download)"),
-            BotCommand("watch", "Deploy a vigilant sentinel (Auto-forward lagayein)"),
-            BotCommand("unwatch", "Dismantle an active sentinel (Auto-forward hatayein)"),
-            BotCommand("watchers", "Enumerate deployed sentinels (Chalu watchers dekhein)"),
-            BotCommand("addsrc", "Inscribe source repository (Source save karein)"),
-            BotCommand("adddst", "Inscribe target repository (Destination save karein)"),
-            BotCommand("delch", "Obliterate registered repository (Saved channel delete karein)"),
-            BotCommand("channels", "Exhibit archived repositories (Saved channels ki list)"),
-            BotCommand("sync", "Invoke mass-synchronization (Bulk copy menu)"),
-            BotCommand("cancel", "Abort executing transmission (Chalta kaam rokein)")
+            BotCommand("start", "⚡ Check Bot Is Working Or Not"),
+            BotCommand("help", "🔎 Check How To Use Bot"),
+            BotCommand("login", "📍 Login Your Telegram String Session"),
+            BotCommand("logout", "🚨 Logout Your Session"),
+            BotCommand("dl", "🦥 Reply to the link to forward"),
+            BotCommand("watch", "👀 To live forward"),
+            BotCommand("unwatch", "🗑 Stop watching a source"),
+            BotCommand("watchers", "📋 List your active watchers"),
+            BotCommand("cancel", "❌ Cancel Your Any Ongoing Task")
         ]
 
+        # B. Define Admin Commands (Public + Extra)
         admin_commands = public_commands + [
-            BotCommand("broadcast", "Promulgate universal decree (Sabko message bhejein)"),
-            BotCommand("botstats", "Scrutinize analytical metrics (Bot ke users/stats dekhein)"),
-            BotCommand("status", "Monitor systemic vitality (Server/CPU status dekhein)"),
-            BotCommand("log", "Retrieve chronological transcript (Error log nikalein)"),
-            BotCommand("pixel", "Circumvent cryptographic obfuscation (Pixeldrain bypass karein)")
+            BotCommand("broadcast", "🗞 Broadcast Message"),
+            BotCommand("botstats", "🔎 Check User Stats"),
+            BotCommand("status", "🦥 Check System Status"),
+            BotCommand("log", "📄 Fetch Bot Logs"),
+            BotCommand("pixel", "✨ Bypass Pixeldrain Links")
         ]
 
+        # C. Set Default Scope (Everyone sees public_commands)
         await app.set_bot_commands(public_commands, scope=BotCommandScopeDefault())
 
+        # D. Set Admin Scope (Admins see EVERYTHING)
+        # Combine ADMINS and SUDOS lists, remove duplicates
         all_admins = set(ADMINS + SUDOS)
         
         for admin_id in all_admins:
@@ -2774,12 +2720,18 @@ async def main():
                     scope=BotCommandScopeChat(chat_id=admin_id)
                 )
             except Exception as e:
-                pass
+                print(f"⚠️ Could not set commands for Admin {admin_id}: {e}")
                 
-        print("✅ Commands automatically built and pushed to Telegram!")
+        print("✅ Commands Updated: Public vs Admin scopes set!")
+        
     except Exception as e:
-        print(f"⚠️ Failed to push commands: {e}")
+        print(f"⚠️ Failed to set commands: {e}")
+    # ----------------------------
     
+    # 3. Smart Load: Only load sessions for users with ACTIVE Watchers
+    print("🔄 Loading Sessions for Active Watchers...")
+    
+    # Get all unique user_ids that have watchers in the DB
     active_watcher_users = set()
     cursor = await db.get_all_watchers()
     async for w in cursor:
@@ -2791,8 +2743,11 @@ async def main():
             continue
             
         try:
+            # Check if already loaded
             if user_id in USER_CLIENTS: continue
 
+            print(f"👤 Starting Watcher Session for: {user_id}")
+            
             u_api = await db.get_api_id(user_id) or API_ID
             u_hash = await db.get_api_hash(user_id) or API_HASH
             
@@ -2803,33 +2758,53 @@ async def main():
                 api_hash=u_hash, 
                 workers=4, 
                 ipv6=False,
-                in_memory=True
+                no_updates=False
+                # Removed in_memory=True so Telegram streams updates perfectly
             )
             
-            user_client.add_handler(MessageHandler(user_watcher_handler))
             await user_client.start()
             USER_CLIENTS[user_id] = user_client
             
+            # Attach Handler without filters to ensure Pyrogram catches ALL channel updates!
+            user_client.add_handler(MessageHandler(user_watcher_handler))
+            
+            print(f"🔄 Syncing channel updates for {user_id}...")
+            
+            # CRITICAL CHECK: Ensure userbot is actually an active participant in all watched sources
             async for w in db.db.watchers.find({'user_id': user_id}):
                 target_source = w['source_id']
                 try: 
+                    # Use get_chat_member to actually verify physical membership!
                     await user_client.get_chat_member(target_source, "me")
+                    print(f"📡 [DEBUG] Membership confirmed. Live stream bound to {target_source}")
                 except Exception as e: 
-                    pass
+                    print(f"🚨 [CRITICAL ERROR] Userbot is NOT a member of Source Channel {target_source}!! Telegram will ignore this channel.")
+                    print(f"Reason: {e}")
+                    print("⚠️ Fix: Manually join this channel on your userbot account!")
 
+            print(f"✅ Active: {user_id}")
+                
+            # WAKE UP CALL 2: Force history pull on specific watched channels
             async for w in db.db.watchers.find({'user_id': user_id}):
                 try: 
                     await user_client.get_chat(w['source_id'])
                     async for _ in user_client.get_chat_history(w['source_id'], limit=1): break
+                    print(f"📡 [DEBUG] Stream bound to {w['source_id']}")
                 except Exception as e: 
-                    pass
+                    print(f"⚠️ [DEBUG] Stream bind failed for {w['source_id']}: {e}")
+
+            print(f"✅ Active: {user_id}")
             
         except Exception as e:
-            pass
+            print(f"❌ Failed to load {user_id}: {e}")
 
+    print(f"🔥 Total Live Listeners: {len(USER_CLIENTS)}")
+
+    # 4. Health Check & Idle
     asyncio.create_task(start_koyeb_health_check())
     await idle()
     
+    # 5. Stop
     await app.stop()
     for uid, client in USER_CLIENTS.items():
         try: await client.stop()
@@ -2837,3 +2812,4 @@ async def main():
         
 if __name__ == "__main__":
     app.run(main())
+        
