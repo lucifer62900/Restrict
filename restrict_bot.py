@@ -106,10 +106,6 @@ HELP_TXT = """<b>📚 BOT'S USAGE GUIDE</b>
 • <code>/removetarget</code> - Remove a specific destination.
 • <code>/removesource</code> (or <code>/unwatch</code>) - Stop watching a source.
 • <code>/cancel</code> - Cancel ongoing tasks.
-• <code>/resume</code> - Resume interrupted batch tasks.
-• <code>/savechannel</code> - Save channel mappings.
-• <code>/mychannels</code> - View your saved channel list.
-• <code>/delchannel</code> - Delete a saved mapping.
 </blockquote>
 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬✘▬"""
 
@@ -182,25 +178,6 @@ class Database:
     async def total_session_users_count(self):
         count = await self.col.count_documents({"session": {"$ne": None}})
         return count
-
-    # --- NEW DB METHODS FOR SAVING CHANNEL LISTS ---
-    async def get_channel_mappings(self, user_id):
-        cursor = self.db.saved_channels.find({"user_id": int(user_id)})
-        return await cursor.to_list(length=100)
-
-    async def save_channel_mapping(self, user_id, source, dest, label):
-        await self.db.saved_channels.insert_one({
-            "user_id": int(user_id),
-            "source": source,
-            "dest": dest,
-            "label": label,
-            "created_at": datetime.datetime.now()
-        })
-        
-    async def delete_channel_mapping(self, user_id, label):
-        result = await self.db.saved_channels.delete_one({"user_id": int(user_id), "label": label})
-        return result.deleted_count > 0
-    # ------------------------------------------------
 
     # --- WATCHER METHODS ---
     async def add_watcher(self, user_id, source_id, dest_id, source_thread=None, dest_thread=None, delay=0, is_restricted=False, source_title=None, dest_title=None, allowed_types=None):
@@ -868,66 +845,6 @@ async def close_menu(client, query):
     except:
         await query.answer("Menu closed.")
 
-# --- NEW: SAVING CHANNELS COMMANDS ---
-@app.on_message(filters.command(["savechannel"]) & filters.private)
-async def save_channel_cmd(client, message):
-    user_id = message.from_user.id
-    args = message.text.split(maxsplit=3)
-    if len(args) < 4:
-        return await message.reply("**Usage:** `/savechannel [Source_ID/Link] [Dest_ID/Link] [Label/Name]`\n\n**Example:** `/savechannel -10012345 -10098765 My Anime Channels`")
-    
-    source = args[1]
-    dest = args[2]
-    label = args[3]
-    
-    await db.save_channel_mapping(user_id, source, dest, label)
-    await message.reply(f"💾 **Magnificent! Mapping Recorded.**\n\n**Label:** `{label}`\n**Source:** `{source}`\n**Destination:** `{dest}`")
-
-@app.on_message(filters.command(["mychannels"]) & filters.private)
-async def my_channels_cmd(client, message):
-    user_id = message.from_user.id
-    channels = await db.get_channel_mappings(user_id)
-    if not channels:
-        return await message.reply("📁 **Alas, thy ledger is empty.** Use `/savechannel` to append records.")
-    
-    text = "📁 **Thy Meticulously Saved Channel Mappings:**\n\n"
-    for idx, ch in enumerate(channels, 1):
-        text += f"**{idx}. {ch['label']}**\n"
-        text += f"   📥 Source: `{ch['source']}`\n"
-        text += f"   📤 Dest: `{ch['dest']}`\n\n"
-        
-    await message.reply(text)
-
-@app.on_message(filters.command(["delchannel"]) & filters.private)
-async def del_channel_cmd(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        return await message.reply("**Usage:** `/delchannel [Label]`")
-    label = message.text.split(None, 1)[1]
-    
-    if await db.delete_channel_mapping(user_id, label):
-        await message.reply(f"🗑 **Erased!** `{label}` hath been removed from thy ledger.")
-    else:
-        await message.reply("⚠️ **Confound it!** Mapping not found.")
-# ------------------------------------
-
-# --- NEW: RESUME COMMAND ---
-@app.on_message(filters.command(["resume"]) & filters.private)
-async def resume_cmd(client, message):
-    user_id = message.from_user.id
-    incomplete = await db.db.resume_tasks.find({"user_id": user_id}).to_list(length=50)
-    if not incomplete:
-        return await message.reply("✅ **Thine operations are pristine.** No interrupted batches found.")
-    
-    await message.reply(f"🔄 **Discovered {len(incomplete)} interrupted batch(es). Recommencing forthwith...**")
-    
-    for task in incomplete:
-        task_data = task.get("task_data")
-        delay = task.get("delay", 3)
-        if task_data:
-            await start_task_final(client, message, task_data, delay, user_id)
-# ---------------------------
-
 @app.on_message(filters.command(["pixel"]) & (filters.user(ADMINS) | filters.user(SUDOS)))
 async def pixel_bypass_handler(client: Client, message: Message):
     if len(message.command) < 2:
@@ -1496,7 +1413,7 @@ async def unwatch_callback(client, query):
 # --- CORE: receive links / start tasks / processing / cancel checks ---
 # ==============================================================================
 
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log", "savechannel", "mychannels", "delchannel", "resume"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in PENDING_TASKS:
@@ -2105,12 +2022,10 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
             if range_match:
                 fromID, toID = int(range_match.group(1)), int(range_match.group(2))
-                original_fromID = int(range_match.group(1))
             else:
                 fromID = toID = int(last_segment)
-                original_fromID = int(last_segment)
 
-            total_count = max(1, toID - original_fromID + 1)
+            total_count = max(1, toID - fromID + 1)
 
             # Session login
             user_data = await db.get_session(user_id)
@@ -2153,34 +2068,6 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             if filter_thread_id:
                 status_text_header += f"**Filter:** `Topic {filter_thread_id} Only` 🎯\n"
 
-            # --- NEW RESUME LOGIC INJECTION ---
-            existing_task = await db.db.resume_tasks.find_one({"user_id": user_id, "link": text})
-            start_index = 1
-            if existing_task and existing_task.get("last_msg_id"):
-                last_id = existing_task["last_msg_id"]
-                if last_id >= fromID and last_id < toID:
-                    fromID = last_id + 1
-                    start_index = (fromID - original_fromID) + 1
-                    status_text_header += f"🔄 **Resuming from ID:** `{fromID}`\n"
-                    
-            # Save/Update task configuration for /resume command
-            await db.db.resume_tasks.update_one(
-                {"user_id": user_id, "link": text},
-                {"$set": {
-                    "task_data": {
-                        "link": text,
-                        "dest_chat_id": targets[0]['dest_id'] if targets else None,
-                        "dest_thread_id": targets[0].get('dest_thread') if targets else None,
-                        "dest_title": dest_title,
-                        "is_restricted": is_restricted,
-                        "allowed_types": allowed_types
-                    },
-                    "delay": delay
-                }},
-                upsert=True
-            )
-            # ----------------------------------
-
             if is_restricted:
                 status_message = await client.send_message(
                     message.chat.id,
@@ -2201,7 +2088,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             # Prepare header text for inner status
             inner_header = f"Filter: Topic {filter_thread_id} Only 🎯" if filter_thread_id else ""
 
-            for index, msgid in enumerate(range(fromID, toID+1), start=start_index):
+            for index, msgid in enumerate(range(fromID, toID+1), start=1):
                 loop_start_time = time.time()
 
                 if task_uuid in ACTIVE_PROCESSES.get(user_id, {}):
@@ -2244,12 +2131,6 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 if is_success: success_count += 1
                 else: failed_count += 1
 
-                # Update progress in DB constantly so it skips even failed ones if crashed
-                await db.db.resume_tasks.update_one(
-                    {"user_id": user_id, "link": text},
-                    {"$set": {"last_msg_id": msgid}}
-                )
-
                 # --- 3. UNIVERSAL SMART SLEEP ---
                 if index < total_count:
                     if is_success:
@@ -2283,10 +2164,6 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             await send_log(f"❌ **Task Crashed**\nUser: `{user_id}`\nError: `{e}`")
 
         finally:
-            if 'was_cancelled' in locals() and not was_cancelled:
-                if index >= total_count:
-                    await db.db.resume_tasks.delete_one({"user_id": user_id, "link": text})
-
             if task_uuid in ACTIVE_PROCESSES.get(user_id, {}):
                 try: del ACTIVE_PROCESSES[user_id][task_uuid]
                 except: pass
@@ -2807,30 +2684,26 @@ async def main():
     # --- AUTO-UPDATE COMMANDS (SCOPED) ---
     print("📝 Updating Bot Commands...")
     try:
-        # A. Define the Public Commands (For Everyone) in Strong British English!
+        # A. Define the Public Commands (For Everyone)
         public_commands = [
-            BotCommand("start", "⚡ Commence interaction with this splendid apparatus"),
-            BotCommand("help", "🔎 Peruse the instruction manual for this contraption"),
-            BotCommand("login", "📍 Authenticate thy Telegram string session"),
-            BotCommand("logout", "🚨 Terminate thy current authenticated session"),
-            BotCommand("dl", "🦥 Procure and dispatch the specified missive or batch"),
-            BotCommand("watch", "👀 Establish a continuous surveillance mechanism"),
-            BotCommand("unwatch", "🗑 Cease surveillance of the designated source"),
-            BotCommand("watchers", "📋 Examine the ledger of thy active surveillances"),
-            BotCommand("cancel", "❌ Halt thine ongoing operation immediately"),
-            BotCommand("resume", "▶️ Recommence thy previously interrupted batches"),
-            BotCommand("savechannel", "💾 Record a source and destination mapping"),
-            BotCommand("mychannels", "📁 Inspect thy recorded channel mappings"),
-            BotCommand("delchannel", "🗑 Erase a previously recorded channel mapping")
+            BotCommand("start", "⚡ Check Bot Is Working Or Not"),
+            BotCommand("help", "🔎 Check How To Use Bot"),
+            BotCommand("login", "📍 Login Your Telegram String Session"),
+            BotCommand("logout", "🚨 Logout Your Session"),
+            BotCommand("dl", "🦥 Reply to the link to forward"),
+            BotCommand("watch", "👀 To live forward"),
+            BotCommand("unwatch", "🗑 Stop watching a source"),
+            BotCommand("watchers", "📋 List your active watchers"),
+            BotCommand("cancel", "❌ Cancel Your Any Ongoing Task")
         ]
 
         # B. Define Admin Commands (Public + Extra)
         admin_commands = public_commands + [
-            BotCommand("broadcast", "🗞 Disseminate a public proclamation to all"),
-            BotCommand("botstats", "🔎 Scrutinise the operational statistics"),
-            BotCommand("status", "🦥 Ascertain the present disposition of the system"),
-            BotCommand("log", "📄 Retrieve the meticulous operational logs"),
-            BotCommand("pixel", "✨ Circumvent the restrictions of Pixeldrain")
+            BotCommand("broadcast", "🗞 Broadcast Message"),
+            BotCommand("botstats", "🔎 Check User Stats"),
+            BotCommand("status", "🦥 Check System Status"),
+            BotCommand("log", "📄 Fetch Bot Logs"),
+            BotCommand("pixel", "✨ Bypass Pixeldrain Links")
         ]
 
         # C. Set Default Scope (Everyone sees public_commands)
@@ -2939,3 +2812,4 @@ async def main():
         
 if __name__ == "__main__":
     app.run(main())
+        
