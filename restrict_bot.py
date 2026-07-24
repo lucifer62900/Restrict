@@ -2626,23 +2626,28 @@ async def main():
     
     try:
         public_commands = [
-            BotCommand("start", "⚡ Check Bot Is Working Or Not"),
-            BotCommand("help", "🔎 Check How To Use Bot"),
-            BotCommand("login", "📍 Login Your Telegram String Session"),
-            BotCommand("logout", "🚨 Logout Your Session"),
-            BotCommand("dl", "🦥 Reply to the link to forward"),
-            BotCommand("watch", "👀 To live forward"),
-            BotCommand("unwatch", "🗑 Stop watching a source"),
-            BotCommand("watchers", "📋 List your active watchers"),
-            BotCommand("cancel", "❌ Cancel Your Any Ongoing Task")
+            BotCommand("start", "Commence the apparatus (Bot chalu karein)"),
+            BotCommand("help", "Peruse the authoritative directives (Guide dekhein)"),
+            BotCommand("login", "Authenticate cryptographic session (Account login karein)"),
+            BotCommand("logout", "Sever the connection (Account logout karein)"),
+            BotCommand("dl", "Instigate extraction of asset (Link se file download)"),
+            BotCommand("watch", "Deploy a vigilant sentinel (Auto-forward lagayein)"),
+            BotCommand("unwatch", "Dismantle an active sentinel (Auto-forward hatayein)"),
+            BotCommand("watchers", "Enumerate deployed sentinels (Chalu watchers dekhein)"),
+            BotCommand("addsrc", "Inscribe source repository (Source save karein)"),
+            BotCommand("adddst", "Inscribe target repository (Destination save karein)"),
+            BotCommand("delch", "Obliterate registered repository (Saved channel delete karein)"),
+            BotCommand("channels", "Exhibit archived repositories (Saved channels list)"),
+            BotCommand("sync", "Invoke mass-synchronization (Bulk copy menu)"),
+            BotCommand("cancel", "Abort executing transmission (Chalta kaam rokein)")
         ]
 
         admin_commands = public_commands + [
-            BotCommand("broadcast", "🗞 Broadcast Message"),
-            BotCommand("botstats", "🔎 Check User Stats"),
-            BotCommand("status", "🦥 Check System Status"),
-            BotCommand("log", "📄 Fetch Bot Logs"),
-            BotCommand("pixel", "✨ Bypass Pixeldrain Links")
+            BotCommand("broadcast", "Promulgate universal decree (Sabko message bhejein)"),
+            BotCommand("botstats", "Scrutinize analytical metrics (Bot ke users/stats dekhein)"),
+            BotCommand("status", "Monitor systemic vitality (Server/CPU status dekhein)"),
+            BotCommand("log", "Retrieve chronological transcript (Error log nikalein)"),
+            BotCommand("pixel", "Circumvent cryptographic obfuscation (Pixeldrain bypass karein)")
         ]
 
         await app.set_bot_commands(public_commands, scope=BotCommandScopeDefault())
