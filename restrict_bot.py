@@ -180,6 +180,19 @@ class Database:
         count = await self.col.count_documents({"session": {"$ne": None}})
         return count
 
+    # --- RESUME PROGRESS METHODS ---
+    async def save_sync_progress(self, user_id, source_id, dest_id, msg_id):
+        query = {"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)}
+        await self.db.sync_progress.update_one(
+            query,
+            {"$set": {"last_msg_id": int(msg_id), "updated_at": datetime.datetime.now()}},
+            upsert=True
+        )
+
+    async def get_sync_progress(self, user_id, source_id, dest_id):
+        data = await self.db.sync_progress.find_one({"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)})
+        return data.get("last_msg_id", 0) if data else 0
+
     # --- WATCHER METHODS ---
     async def add_watcher(self, user_id, source_id, dest_id, source_thread=None, dest_thread=None, delay=0, is_restricted=False, source_title=None, dest_title=None, allowed_types=None):
         if allowed_types is None:
@@ -285,7 +298,6 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=50,                 
     sleep_threshold=20,
-    # max_concurrent_transmissions=10, 
     ipv6=False                    
 )
 
@@ -346,7 +358,6 @@ CANCEL_FLAGS = {}  # task_uuid -> True when cancelled
 
 batch_temp = type("BT", (), {})()
 batch_temp.ACTIVE_TASKS = defaultdict(int)
-# IS_BATCH removed — cancellation is handled per task_uuid via CANCEL_FLAGS
 
 # --- ROBUST CONCURRENCY SETTINGS ---
 # 1. Server Limit: Max 30 uploads total (Protects your server CPU/Bandwidth)
@@ -428,36 +439,34 @@ def sanitize_filename(filename: str) -> str:
     return f"{name}{ext}"
 
 # ==============================================================================
-# --- NEW EXACT RENAMING LOGIC ---
+# --- STRICT RENAME LOGIC (As per user instructions) ---
 # ==============================================================================
 def smart_rename(filename, caption_text=""):
-    """
-    Strips ONLY leading/trailing junk brackets, dots, underscores, and URLs.
-    Leaves the main title and specific internal bracket tags EXACTLY as they are.
-    """
     filename_str = str(filename or "Unknown_File.mkv")
+    caption_str = str(caption_text or "")
     
-    # 1. Unquote the URL-encoded string
     name_raw = urllib.parse.unquote(filename_str)
-    
-    # 2. Extract Base Extension
     base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)$', name_raw, re.IGNORECASE)
     base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
     
-    # Remove the extension temporarily to avoid breaking the text processing
     clean_name = re.sub(r'\.\w{3,4}$', '', name_raw) 
     
-    # 3. Replace dots and underscores with spaces
+    # Optional: If you want caption text appended, you can uncomment the next line
+    # clean_name = f"{clean_name} {caption_str}"
+    
+    # 1. Replace dots and underscores with spaces
     clean_name = clean_name.replace('.', ' ').replace('_', ' ')
     
-    # 4. Remove leading junk specifically like "- []", "[]", "[@joinhere]", "@username "
-    # This prevents the bot from deleting [E188-207] in the middle of a string.
-    clean_name = re.sub(r'^[-~\s]*\[.*?\]\s*', '', clean_name)
-    clean_name = re.sub(r'^[-~\s]*@[a-zA-Z0-9_]+\s*', '', clean_name)
+    # 2. Remove leading junk blocks like [] or [@joinhere] or - [] at the VERY BEGINNING
+    clean_name = re.sub(r'^[-~\s]*\[.*?\][-~\s]*', '', clean_name)
     
-    # 5. Remove exact URL links and standalone @usernames anywhere inside
+    # 3. Remove leading @username
+    clean_name = re.sub(r'^[-~\s]*@[a-zA-Z0-9_]+[-~\s]*', '', clean_name)
+    
+    # 4. Remove URLs and remaining @usernames anywhere
     junk_patterns = [
-        r'(?:https?:)?//\S+', r'\bwww\.\S+', 
+        r'(?:https?:)?//\S+', 
+        r'\bwww\.\S+', 
         r'\b[a-zA-Z0-9-]+\.(com|net|org|in|site|cc|tk|ml|me|club|xyz|tv|one|movies|pro)\b',
         r'@[a-zA-Z0-9_]+'
     ]
@@ -465,16 +474,21 @@ def smart_rename(filename, caption_text=""):
     for junk in junk_patterns:
         clean_name = re.sub(junk, '', clean_name, flags=re.IGNORECASE)
 
-    # 6. Final cleanup of multiple spaces
+    # 5. Clean up multiple spaces
     clean_name = re.sub(r'\s+', ' ', clean_name).strip(' -')
     
     if len(clean_name) <= 2:
         clean_name = "Unknown Title"
 
     perfect_caption = clean_name
+    
+    # HTML Escape Fix for safety
+    perfect_caption_html = perfect_caption.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    
     perfect_filename = clean_name + base_ext
 
-    return perfect_caption, perfect_filename
+    return perfect_caption_html, perfect_filename
+
 # ==============================================================================
 
 async def check_link_restriction(user_id, link_text):
@@ -763,28 +777,47 @@ def get_message_type(msg: Message):
     return None
 
 # ==============================================================================
-# --- SAVED CHANNELS & SYNC MENU ---
+# --- 💾 SAVED CHANNELS & SYNC MENU ---
 # ==============================================================================
 
 @app.on_message(filters.command(["addsrc"]) & filters.private)
 async def addsrc_cmd(client, message):
     close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
     try:
-        _, ch_id, name = message.text.split(maxsplit=2)
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
+            return await message.reply("❌ Formatting erratum. Utilize: `/addsrc [-100xxxx/@username] [Nomenclature]`", reply_markup=close_btn)
+        
+        ch_id = parts[1]
+        name = parts[2]
+        
+        # Validation Check: Ensure it's a valid ID or Username format
+        if not (ch_id.startswith("-100") or ch_id.startswith("@") or ch_id.isdigit()):
+            return await message.reply("❌ Invalid format. Must start with '-100' or '@'.\nExample: `/addsrc -100123456789 MyChannel`", reply_markup=close_btn)
+            
         await db.save_channel(message.from_user.id, ch_id, "source", name)
         await message.reply(f"✅ **Source Repository Inscribed:**\n`{ch_id}` - {name}", reply_markup=close_btn)
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/addsrc [-100xxxx/@username] [Nomenclature]`", reply_markup=close_btn)
+    except Exception as e:
+        await message.reply(f"❌ Error processing command: `{e}`", reply_markup=close_btn)
 
 @app.on_message(filters.command(["adddst"]) & filters.private)
 async def adddst_cmd(client, message):
     close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
     try:
-        _, ch_id, name = message.text.split(maxsplit=2)
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
+            return await message.reply("❌ Formatting erratum. Utilize: `/adddst [-100xxxx/@username] [Nomenclature]`", reply_markup=close_btn)
+            
+        ch_id = parts[1]
+        name = parts[2]
+        
+        if not (ch_id.startswith("-100") or ch_id.startswith("@") or ch_id.isdigit()):
+            return await message.reply("❌ Invalid format. Must start with '-100' or '@'.\nExample: `/adddst -100123456789 MyChannel`", reply_markup=close_btn)
+
         await db.save_channel(message.from_user.id, ch_id, "dest", name)
         await message.reply(f"✅ **Target Repository Inscribed:**\n`{ch_id}` - {name}", reply_markup=close_btn)
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/adddst [-100xxxx/@username] [Nomenclature]`", reply_markup=close_btn)
+    except Exception as e:
+        await message.reply(f"❌ Error processing command: `{e}`", reply_markup=close_btn)
 
 @app.on_message(filters.command(["delch"]) & filters.private)
 async def delch_cmd(client, message):
@@ -837,6 +870,7 @@ async def sync_src_cb(client, query):
     src_id = query.data.split("_")[2]
     dests = await db.get_saved_channels(query.from_user.id, "dest")
     
+    close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close_menu")]])
     if not dests:
         return await query.answer("❌ Target archives barren! Execute `/adddst` initially.", show_alert=True)
         
@@ -1610,7 +1644,7 @@ async def unwatch_callback(client, query):
 # --- CORE: receive links / start tasks / processing / cancel checks ---
 # ==============================================================================
 
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log", "addsrc", "adddst", "delch", "channels", "sync"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in PENDING_TASKS:
@@ -2214,19 +2248,20 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             if len(parts) >= 3 and parts[1].isdigit(): 
                 filter_thread_id = int(parts[1])
 
-            # Parse range
+            # Parse range safely (Fixed Unbound Bug)
             last_segment = parts[-1].strip()
-            range_match = re.search(r"(\d+)\s*-\s*([a-zA-Z0-9]+)", text) # Supports 'all' keyword
+            range_match = re.search(r"(\d+)\s*-\s*([a-zA-Z0-9]+)", text)
             
             try: chatid_check = int("-100" + parts[0]) if "https://t.me/c/" in text else parts[0]
             except Exception: chatid_check = parts[0]
 
             if range_match:
                 fromID = int(range_match.group(1))
+                toID = fromID # Initialize fallback to prevent UnboundLocalError
                 end_str = range_match.group(2).lower()
                 if end_str != "all":
                     try: toID = int(end_str)
-                    except: toID = fromID
+                    except: pass
             else:
                 try: fromID = toID = int(last_segment)
                 except: fromID = toID = 1
@@ -2266,8 +2301,8 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                         toID = last_msg.id
                 except Exception as e:
                     print(f"Failed to fetch last message for ALL: {e}")
-                    toID = fromID
-
+            
+            # --- RESUME LOGIC ---
             primary_dest = targets[0]['dest_id'] if targets else "unknown_dest"
             saved_msg_id = await db.get_sync_progress(user_id, chatid_check, primary_dest)
 
@@ -2284,6 +2319,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 resume_msg = (f"♻️ **AUTO-RESUME ACTIVATED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n▶️ **Resuming From ID:** `{fromID}`")
                 try: await client.send_message(message.chat.id, resume_msg, reply_to_message_id=message.id)
                 except: pass
+            # --------------------------
 
             total_count = max(1, toID - fromID + 1)
             
@@ -2361,7 +2397,8 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
 
                 if is_success: success_count += 1
                 else: failed_count += 1
-
+                
+                # --- UPDATE PROGRESS ---
                 if not was_cancelled: 
                     await db.save_sync_progress(user_id, chatid_check, primary_dest, msgid)
 
@@ -2429,18 +2466,20 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             else:
                 header = f"Batch was Completed! ✅ {user_mention} ✨"
 
-            final_text = (
-                f"{header}\n"
-                f"📝 **Task :** {source_title} → {dest_title}\n"
-                f"⏱ **Time Taken:** `{time_taken_str}`\n"
-                f"📊 **Statistics:**\n"
-                f"├ 📥 **Total Requested:** `{total_count}`\n"
-                f"├ ✅ **Successful:** `{success_count}`\n"
-                f"└ ❌ **Failed/Skipped:** `{failed_count}`"
-            )
+            if total_count > 0:
+                final_text = (
+                    f"{header}\n"
+                    f"📝 **Task :** {source_title} → {dest_title}\n"
+                    f"⏱ **Time Taken:** `{time_taken_str}`\n"
+                    f"📊 **Statistics:**\n"
+                    f"├ 📥 **Total Requested:** `{total_count}`\n"
+                    f"├ ✅ **Successful:** `{success_count}`\n"
+                    f"└ ❌ **Failed/Skipped:** `{failed_count}`"
+                )
+                
+                try: await client.send_message(message.chat.id, final_text, reply_to_message_id=message.id)
+                except: pass
             
-            try: await client.send_message(message.chat.id, final_text, reply_to_message_id=message.id)
-            except: pass
             try: await status_message.delete()
             except: pass
 
@@ -2499,16 +2538,16 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             dest_chat_id = dest['dest_id']
             dest_thread_id = dest.get('dest_thread')
             try:
-                await client.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
+                await client.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                 forward_success = True
             except Exception:
                 try:
-                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
+                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     forward_success = True
                 except FloodWait as e:
                     if e.value > 300: raise e
                     await asyncio.sleep(e.value + 2)
-                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id)
+                    await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     forward_success = True
                 except Exception as e:
                     print(f"Task Fast-Copy blocked: {e}")
