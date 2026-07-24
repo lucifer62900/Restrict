@@ -75,31 +75,38 @@ ADMINS = [int(x) for x in admin_str.split(",") if x.strip().isdigit()]
 sudo_str = os.environ.get("SUDOS", "")
 SUDOS = [int(x) for x in sudo_str.split(",") if x.strip().isdigit()]
 
-HELP_TXT = """<b>📚 COMPREHENSIVE OPERATIONAL DIRECTIVE (V5.2)</b>
+HELP_TXT = """<b>📚 BOT'S USAGE GUIDE</b>
 
 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬✘▬
 <blockquote expandable>
-<b>🟢 1. SINGLE & BATCH MASS-EXTRACTION</b>
-• Paste a singular URL to process an isolated asset.
-• Paste URLs denoting a specific continuum to process in bulk.
-• Type <b>all</b> as the terminal node to extract the entire repository!
+<b>🟢 1. SINGLE & BATCH DOWNLOADS</b>
+• Send a single link to process one post.
+• Send links in a "From - To" format to process multiple files at once.
+• Type <b>all</b> to download everything to the end of the channel!
 • <b>Examples:</b>
   ├ <code>https://t.me/xxxx/1001</code>
   ├ <code>https://t.me/c/xxxx/101 - 120</code>
+  └ <code>https://t.me/c/xxxx/1 - all</code>
 
-<b>💾 2. ARCHIVAL REPOSITORY MANAGER</b>
-• <code>/addsrc [ID/@username] [Nomenclature]</code> - Inscribe Source Channel.
-• <code>/adddst [ID/@username] [Nomenclature]</code> - Inscribe Target Channel.
-• <code>/channels</code> - Exhibit the grand compendium.
-• <code>/sync</code> - Invoke the synchronized mass-relay interface!
+<b>👀 2. LIVE WATCHERS (AUTO-FORWARDING)</b>
+• Automatically monitor a source and forward new messages to targets.
+• Supports routing to <b>Multiple Targets</b> simultaneously!
+• Features built-in <b>Content Filtering</b> (e.g., Only Videos & Docs).
+• <b>Setup:</b> Send <code>/watch https://t.me/channel/123</code>
+• <b>Manage:</b> Use <code>/watchers</code> to view and delete mappings.
 
-<b>👀 3. VIGILANT SENTINELS (AUTO-RELAY)</b>
-• <code>/watch https://t.me/channel/123</code> - Deploy an automated observer.
-• <code>/watchers</code> (or <code>/list</code>) - Enumerate deployed configurations.
+<b>🤖 3. BOT CHATS & RESTRICTED CONTENT</b>
+• Send the link with <code>/b/</code>, the bot's username, and message ID.
+• <b>Format:</b> <code>https://t.me/b/botusername/4321</code>
+• Bypasses "Saving Restricted Content" limits automatically!
 
-<b>🛠 4. UTILITY DIRECTIVES</b>
-• <code>/dl</code> - Reply to an asset's locator to execute transfer.
-• <code>/cancel</code> - Abort and instantaneously halt executions.
+<b>🛠 4. USEFUL COMMANDS</b>
+• <code>/dl</code> - Reply to a link to process it.
+• <code>/watch</code> - Setup a new live auto-forwarder.
+• <code>/watchers</code> (or <code>/list</code>) - View active watchers & filters.
+• <code>/removetarget</code> - Remove a specific destination.
+• <code>/removesource</code> (or <code>/unwatch</code>) - Stop watching a source.
+• <code>/cancel</code> - Cancel ongoing tasks.
 </blockquote>
 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬✘▬"""
 
@@ -260,22 +267,6 @@ class Database:
             
         return result.modified_count > 0
 
-    # --- SAVED CHANNELS ENGINE (NEW) ---
-    async def save_channel(self, user_id, ch_id, ch_type, name):
-        await self.db.saved_channels.update_one(
-            {"user_id": int(user_id), "channel_id": str(ch_id)},
-            {"$set": {"ch_type": ch_type, "name": name, "updated_at": datetime.datetime.now()}},
-            upsert=True
-        )
-
-    async def get_saved_channels(self, user_id, ch_type):
-        cursor = self.db.saved_channels.find({"user_id": int(user_id), "ch_type": ch_type})
-        return await cursor.to_list(length=100)
-
-    async def delete_saved_channel(self, user_id, ch_id):
-        result = await self.db.saved_channels.delete_one({"user_id": int(user_id), "channel_id": str(ch_id)})
-        return result.deleted_count > 0
-
 db = Database(DB_URI, DB_NAME)
 
 # ==============================================================================
@@ -420,16 +411,26 @@ def sanitize_filename(filename: str) -> str:
         ext = ".dat"
     return f"{name}{ext}"
 
-# --- SAFE & SMART RENAME LOGIC (FIXED) ---
+# ==============================================================================
+# 🧠 BULLETPROOF SMART RENAME LOGIC (Fixed for @kc_dio_ etc.)
+# ==============================================================================
 def smart_rename(filename, caption_text=""):
     filename_str = str(filename or "Unknown_File.mkv")
     caption_str = str(caption_text or "")
     
-    # Combine filename and caption to search for details
-    name_raw = urllib.parse.unquote(filename_str).replace('.', ' ').replace('_', ' ').replace('+', ' ')
+    # 1. Unquote the URL style text
+    name_raw = urllib.parse.unquote(filename_str)
+    
+    # 2. Extract Base Extension
+    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', name_raw, re.IGNORECASE)
+    base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
+    
+    # Remove the extension temporarily to avoid breaking the title logic
+    name_raw = re.sub(r'\.\w{3,4}$', '', name_raw) 
+    
     full_text = f"{name_raw} {caption_str}"
     
-    # 1. Extract Details Safely
+    # 3. Extract Details (Year, Res, Codec, Lang) Safely
     year_match = re.search(r'\b(19\d{2}|20\d{2})\b', full_text)
     year = year_match.group(1) if year_match else ""
 
@@ -447,47 +448,67 @@ def smart_rename(filename, caption_text=""):
     if re.search(r'\bhindi\b', full_text, re.I): langs_found.append("Hindi")
     if re.search(r'\btamil\b', full_text, re.I): langs_found.append("Tamil")
     if re.search(r'\btelugu\b', full_text, re.I): langs_found.append("Telugu")
+    if re.search(r'\bbengali\b', full_text, re.I): langs_found.append("Bengali")
+    if re.search(r'\bmalayalam\b', full_text, re.I): langs_found.append("Malayalam")
+    if re.search(r'\benglish\b', full_text, re.I): langs_found.append("English")
     
     lang = "" 
-    if re.search(r'multi|dual', full_text, re.I) or len(langs_found) > 1: 
+    if re.search(r'\b(multi|dual)\b', full_text, re.I) or len(langs_found) > 1: 
         lang = "Multi Audio"
     elif len(langs_found) == 1:
         lang = langs_found[0]
 
-    # 2. Targeted Junk Removal (No aggressive bracket deleting)
-    junk_patterns = [
-        r'(?:https?:)?//\S+', r'\bwww\.\S+', r'@[a-zA-Z0-9_]+', # URLs and @usernames
-        r'\b(skyemovies|hdhub4u|tamiletc|toonworld4all|mlwbd|vegmovies|desicinemas|1tamilmv|tamilmv)\b', # Popular sites
-        r'join\s*(?:&|and)?\s*share', r'join\s*channel', r'join\s*here', r'join\s*now', r'subscribe', # Join texts
-        r'downloaded from',
-        r'🎞', r'📸', r'▬', r'🔥', r'👇', r'🔗', r':-', r'==', r'\|', r'~', r'⚡', r'⭐', r'✨', r'▶', r'💖', # Emojis
-        r'\bUNRATED\b', r'\bUNRATEDXX\b'
-    ]
-
-    clean_name = urllib.parse.unquote(filename_str)
+    # 4. Clean Name - Targeted Junk Removal
+    clean_name = name_raw
     
-    # Apply junk removal one by one
+    # Fix for @username: ONLY remove if it's at start, end, or space separated
+    clean_name = re.sub(r'^@[a-zA-Z0-9_]+[-_]', '', clean_name) # Prefix (e.g. @kc_dio_)
+    clean_name = re.sub(r'@[a-zA-Z0-9_]+$', '', clean_name) # Suffix (e.g. @ONAAMovies)
+    clean_name = re.sub(r'\s@[a-zA-Z0-9_]+', '', clean_name) # Standalone (e.g.  @username)
+    clean_name = re.sub(r'\[@[a-zA-Z0-9_]+\]', '', clean_name) # Bracketed (e.g. [@username])
+    
+    # Other explicit junk and domains
+    junk_patterns = [
+        r'(?:https?:)?//\S+', r'\bwww\.\S+', 
+        r'\b[a-zA-Z0-9-]+\.(com|net|org|in|site|cc|tk|ml|me|club|xyz|tv|one|movies|pro)\b',
+        r'\b(skyemovies|hdhub4u|tamiletc|toonworld4all|mlwbd|vegmovies|desicinemas|1tamilmv|tamilmv|katmoviehd|moviesverse)\b',
+        r'join\s*(?:&|and)?\s*share', r'join\s*channel', r'join\s*here', r'join\s*now', r'subscribe', r'downloaded from',
+        r'🎞', r'📸', r'▬', r'🔥', r'👇', r'🔗', r':-', r'==', r'\|', r'~', r'⚡', r'⭐', r'✨', r'▶', r'💖',
+        r'\bUNRATED\b', r'\bUNRATEDXX\b', r'\bESub\b', r'\bEsubs\b'
+    ]
+    
     for junk in junk_patterns:
         clean_name = re.sub(junk, '', clean_name, flags=re.IGNORECASE)
-        
-    # Remove the extracted tags from the title so they don't repeat twice
-    clean_name = re.sub(r'(?i)\b(1080p|720p|480p|2160p|4k|x264|x265|hevc|avc|hindi|tamil|telugu|web-dl|bluray|brrip|hdrip|aac)\b', '', clean_name)
-    if year:
-        clean_name = clean_name.replace(year, '')
-        
-    # Final cleanup of spaces and weird dots
-    clean_name = clean_name.replace('.', ' ').replace('_', ' ').replace('+', ' ')
-    clean_name = re.sub(r'\s+', ' ', clean_name).strip(' -()[]')
-    
-    if len(clean_name) <= 2 or clean_name.lower() in ['mp4', 'mkv', 'avi']:
-        clean_name = "Unknown Title"
 
-    # Base extension extraction
-    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', filename_str, re.IGNORECASE)
-    base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
+    # Replace dots, underscores, pluses with spaces BEFORE splitting
+    clean_name = clean_name.replace('.', ' ').replace('_', ' ').replace('+', ' ')
     
-    # 3. Format the Final String Nicely
-    parts = [clean_name]
+    # 5. SPLIT to get pure title
+    # We strictly chop the string when we see a quality, codec, or language tag.
+    split_regex = r'\b(1080p|720p|480p|2160p|4k|bluray|web-dl|web-rip|webrip|hdrip|brrip|x264|x265|hevc|avc|hindi|tamil|telugu|bengali|malayalam|english|dual audio|multi audio)\b'
+    
+    # This keeps only the pure Movie/Series Name
+    extracted = re.split(split_regex, clean_name, flags=re.I)[0].strip()
+    
+    # If year was inside the extracted title, remove it to avoid repeating (e.g. "Movie 2021" -> "Movie")
+    if year and year in extracted:
+        extracted = extracted.replace(year, '')
+        
+    # Clean up empty brackets and trailing hyphens
+    extracted = re.sub(r'[\(\[].*?[\)\]]', '', extracted)
+    extracted = re.sub(r'\s+', ' ', extracted).strip(' -_()[]')
+
+    # Fallback if title extraction accidentally wiped everything 
+    if len(extracted) <= 2 or extracted.lower() in ['mp4', 'mkv', 'avi']:
+        extracted = clean_name
+        extracted = re.sub(split_regex, '', extracted, flags=re.I) # Manually remove tags
+        if year: extracted = extracted.replace(year, '')
+        extracted = re.sub(r'\s+', ' ', extracted).strip(' -_()[]')
+        if len(extracted) <= 2:
+            extracted = "Unknown Title"
+
+    # 6. Format Final Perfect String
+    parts = [extracted]
     if year: parts.append(f"({year})")
     if lang: parts.append(f"[{lang}]")
     if res: parts.append(f"[{res}]")
@@ -497,6 +518,7 @@ def smart_rename(filename, caption_text=""):
     perfect_filename = perfect_caption + base_ext
 
     return perfect_caption, perfect_filename
+# ==============================================================================
 
 async def check_link_restriction(user_id, link_text):
     clean_text = link_text.replace("https://", "").replace("http://", "").replace("t.me/", "").replace("c/", "")
@@ -533,7 +555,7 @@ async def check_link_restriction(user_id, link_text):
     if is_private:
         user_session = await db.get_session(user_id)
         if not user_session:
-            return None, "🔒 **Confidential Sector:** Authenticate via /login."
+            return None, "🔒 **Private Link:** Please /login to verify restrictions."
         
         api_id = await db.get_api_id(user_id)
         api_hash = await db.get_api_hash(user_id)
@@ -552,22 +574,22 @@ async def check_link_restriction(user_id, link_text):
             msg = await check_client.get_messages(chat_id, msg_id)
             if getattr(msg.chat, "has_protected_content", False) or getattr(msg, "has_protected_content", False):
                 is_restricted = True
-                status_msg = "🔒 **Source is RESTRICTED** (Download Mode enforced)"
+                status_msg = "🔒 **Source is RESTRICTED** (Will use Download Mode)"
             else:
                 is_restricted = False
-                status_msg = "🔓 **Source is PUBLIC** (Fast-Relay enabled)"
+                status_msg = "🔓 **Source is PUBLIC/UNRESTRICTED** (Will use Fast Forward)"
         else:
             chat = await check_client.get_chat(chat_id)
             if getattr(chat, "has_protected_content", False):
                 is_restricted = True
-                status_msg = "🔒 **Channel is RESTRICTED** (Download Mode enforced)"
+                status_msg = "🔒 **Channel is RESTRICTED** (Will use Download Mode)"
             else:
                 is_restricted = False
-                status_msg = "🔓 **Channel is PUBLIC**"
+                status_msg = "🔓 **Channel is PUBLIC/UNRESTRICTED**"
             
     except Exception as e:
         if "CHANNEL_PRIVATE" in str(e) or "USER_NOT_PARTICIPANT" in str(e):
-            status_msg = "⚠️ **Verification Failed:** Access denied or invalid reference."
+            status_msg = "⚠️ **Private Chat:** I can't check yet (You need to join first)."
         else:
             status_msg = f"⚠️ **Check Failed:** `{str(e)[:30]}...`"
     finally:
@@ -680,12 +702,12 @@ async def downstatus(client: Client, status_message: Message, chat, index: int, 
         header_section = f"{header_text}\n" if header_text else ""
 
         status = (
-            f"📥 **Downloading Extract ({index}/{total_count})**\n"
+            f"📥 **Downloading File ({index}/{total_count})**\n"
             f"└ 📂 `{max(0, total_count-index)}` remaining\n\n"
             f"**{rec.get('percent', 0):.1f}%** │ `{generate_bar(rec.get('percent', 0), length=12)}`\n\n"
             f"{header_section}"
-            f"🚀 **Velocity:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
-            f"💾 **Capacity:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
+            f"🚀 **Speed:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
+            f"💾 **Size:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
             f"⏳ **ETA:** `{get_readable_time(int(rec.get('eta', 0)) if rec.get('eta') else 0)}`"
         )
 
@@ -718,12 +740,12 @@ async def upstatus(client: Client, status_message: Message, chat, index: int, to
         header_section = f"{header_text}\n" if header_text else ""
 
         status = (
-            f"☁️ **Uploading Payload ({index}/{total_count})**\n"
+            f"☁️ **Uploading File ({index}/{total_count})**\n"
             f"└ 📤 `{max(0, total_count-index)}` remaining\n\n"
             f"**{rec.get('percent', 0):.1f}%** │ `{generate_bar(rec.get('percent', 0), length=12)}`\n\n"
             f"{header_section}"
-            f"🚀 **Velocity:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
-            f"💾 **Capacity:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
+            f"🚀 **Speed:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
+            f"💾 **Size:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
             f"⏳ **ETA:** `{get_readable_time(int(rec.get('eta', 0)) if rec.get('eta') else 0)}`"
         )
 
@@ -750,115 +772,6 @@ def get_message_type(msg: Message):
     if msg.photo: return "Photo"
     if msg.text: return "Text"
     return None
-
-# ==============================================================================
-# --- SAVED CHANNELS & SYNC MENU ---
-# ==============================================================================
-
-@app.on_message(filters.command(["addsrc"]) & filters.private)
-async def addsrc_cmd(client, message):
-    try:
-        _, ch_id, name = message.text.split(maxsplit=2)
-        await db.save_channel(message.from_user.id, ch_id, "source", name)
-        await message.reply(f"✅ **Source Repository Inscribed:**\n`{ch_id}` - {name}")
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/addsrc [-100xxxx/@username] [Nomenclature]`")
-
-@app.on_message(filters.command(["adddst"]) & filters.private)
-async def adddst_cmd(client, message):
-    try:
-        _, ch_id, name = message.text.split(maxsplit=2)
-        await db.save_channel(message.from_user.id, ch_id, "dest", name)
-        await message.reply(f"✅ **Target Repository Inscribed:**\n`{ch_id}` - {name}")
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/adddst [-100xxxx/@username] [Nomenclature]`")
-
-@app.on_message(filters.command(["delch"]) & filters.private)
-async def delch_cmd(client, message):
-    try:
-        _, ch_id = message.text.split(maxsplit=1)
-        if await db.delete_saved_channel(message.from_user.id, ch_id):
-            await message.reply(f"🗑 **Repository {ch_id} obliterated successfully!**")
-        else:
-            await message.reply("⚠️ Repository undetected in archival ledger.")
-    except:
-        await message.reply("❌ Formatting erratum. Utilize: `/delch [-100xxxx/@username]`")
-
-@app.on_message(filters.command(["channels"]) & filters.private)
-async def channels_cmd(client, message):
-    sources = await db.get_saved_channels(message.from_user.id, "source")
-    destinations = await db.get_saved_channels(message.from_user.id, "dest")
-    
-    text = "📂 **Archived Source Repositories:**\n"
-    for ch in sources:
-        text += f"├ {ch['name']} (`{ch['channel_id']}`)\n"
-    if not sources:
-        text += "└ N/A\n"
-        
-    text += "\n🎯 **Archived Target Repositories:**\n"
-    for ch in destinations:
-        text += f"├ {ch['name']} (`{ch['channel_id']}`)\n"
-    if not destinations:
-        text += "└ N/A"
-        
-    await message.reply(text)
-
-@app.on_message(filters.command(["sync"]) & filters.private)
-async def sync_cmd(client, message):
-    sources = await db.get_saved_channels(message.from_user.id, "source")
-    if not sources:
-        return await message.reply("❌ Source archives barren! Execute `/addsrc` initially.")
-        
-    buttons = []
-    for ch in sources:
-        buttons.append([InlineKeyboardButton(ch['name'], callback_data=f"sync_src_{ch['channel_id']}")])
-        
-    await message.reply("📂 **Phase 1: Designate Source Repository**", reply_markup=InlineKeyboardMarkup(buttons))
-
-@app.on_callback_query(filters.regex(r"^sync_src_"))
-async def sync_src_cb(client, query):
-    src_id = query.data.split("_")[2]
-    dests = await db.get_saved_channels(query.from_user.id, "dest")
-    
-    if not dests:
-        return await query.answer("❌ Target archives barren! Execute `/adddst` initially.", show_alert=True)
-        
-    buttons = []
-    for ch in dests:
-        buttons.append([InlineKeyboardButton(ch['name'], callback_data=f"sync_dst_{src_id}_{ch['channel_id']}")])
-        
-    await query.message.edit("🎯 **Phase 2: Designate Target Repository**", reply_markup=InlineKeyboardMarkup(buttons))
-
-@app.on_callback_query(filters.regex(r"^sync_dst_"))
-async def sync_dst_cb(client, query):
-    user_id = query.from_user.id
-    _, _, src_id, dst_id = query.data.split("_", 3)
-    
-    await query.message.edit("🔢 **Phase 3: Delineate Continuum**\n\nTransmit the numerical spectrum representing the messages.\n\n**Paradigm:**\n`1 - 100` (Transmits message ID 1 to 100)\n`all` (Encompasses the entire repository)")
-    
-    range_msg = await client.ask(user_id, "Enter your continuum here (e.g. 10 - 200 or all):", timeout=120)
-    
-    if range_msg.text == "/cancel" or not range_msg.text:
-        return await range_msg.reply("❌ Synchronization aborted.")
-
-    clean_src = str(src_id).replace("-100", "") if str(src_id).startswith("-100") else str(src_id)
-    constructed_link = f"https://t.me/c/{clean_src}/{range_msg.text.strip()}"
-    
-    wait_msg = await range_msg.reply("🔎 **Analyzing Cryptic Locator...**", quote=True)
-    is_restricted, status_text = await check_link_restriction(user_id, constructed_link)
-    await wait_msg.delete()
-
-    PENDING_TASKS[user_id] = {
-        "link": constructed_link,
-        "dest_chat_id": dst_id,
-        "dest_thread_id": None,
-        "dest_title": f"Target Matrix {dst_id}",
-        "status": "waiting_speed",
-        "is_restricted": is_restricted
-    }
-    
-    await range_msg.reply(f"✨ **Matrix Assimilated!**\n{status_text}", quote=True)
-    await ask_for_speed(range_msg)
 
 # ==============================================================================
 # --- HANDLERS ---
@@ -1523,7 +1436,7 @@ async def unwatch_callback(client, query):
 # --- CORE: receive links / start tasks / processing / cancel checks ---
 # ==============================================================================
 
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log", "addsrc", "adddst", "delch", "channels", "sync", "pixel"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in PENDING_TASKS:
@@ -2603,19 +2516,16 @@ async def process_watcher_message(client, message):
                 success = False
                 dest_id = t['dest_id']
                 dest_thread = t.get('dest_thread')
-                owner_client = USER_CLIENTS.get(owner_id)
                 
-                if owner_client:
-                    try: 
-                        await owner_client.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
-                        success = True
-                    except Exception as e1: 
-                        try:
-                            await client.get_chat(dest_id)
-                        except Exception:
-                            pass
-                        
-                if not success:
+                try: 
+                    await app.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
+                    success = True
+                except Exception as e1: 
+                    try:
+                        await client.get_chat(dest_id)
+                    except Exception:
+                        pass
+
                     try: 
                         await client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                         success = True
@@ -2716,28 +2626,23 @@ async def main():
     
     try:
         public_commands = [
-            BotCommand("start", "Commence the apparatus (Bot chalu karein)"),
-            BotCommand("help", "Peruse the authoritative directives (Guide dekhein)"),
-            BotCommand("login", "Authenticate cryptographic session (Account login karein)"),
-            BotCommand("logout", "Sever the connection (Account logout karein)"),
-            BotCommand("dl", "Instigate extraction of asset (Link se file download)"),
-            BotCommand("watch", "Deploy a vigilant sentinel (Auto-forward lagayein)"),
-            BotCommand("unwatch", "Dismantle an active sentinel (Auto-forward hatayein)"),
-            BotCommand("watchers", "Enumerate deployed sentinels (Chalu watchers dekhein)"),
-            BotCommand("addsrc", "Inscribe source repository (Source save karein)"),
-            BotCommand("adddst", "Inscribe target repository (Destination save karein)"),
-            BotCommand("delch", "Obliterate registered repository (Saved channel delete karein)"),
-            BotCommand("channels", "Exhibit archived repositories (Saved channels list)"),
-            BotCommand("sync", "Invoke mass-synchronization (Bulk copy menu)"),
-            BotCommand("cancel", "Abort executing transmission (Chalta kaam rokein)")
+            BotCommand("start", "⚡ Check Bot Is Working Or Not"),
+            BotCommand("help", "🔎 Check How To Use Bot"),
+            BotCommand("login", "📍 Login Your Telegram String Session"),
+            BotCommand("logout", "🚨 Logout Your Session"),
+            BotCommand("dl", "🦥 Reply to the link to forward"),
+            BotCommand("watch", "👀 To live forward"),
+            BotCommand("unwatch", "🗑 Stop watching a source"),
+            BotCommand("watchers", "📋 List your active watchers"),
+            BotCommand("cancel", "❌ Cancel Your Any Ongoing Task")
         ]
 
         admin_commands = public_commands + [
-            BotCommand("broadcast", "Promulgate universal decree (Sabko message bhejein)"),
-            BotCommand("botstats", "Scrutinize analytical metrics (Bot ke users/stats dekhein)"),
-            BotCommand("status", "Monitor systemic vitality (Server/CPU status dekhein)"),
-            BotCommand("log", "Retrieve chronological transcript (Error log nikalein)"),
-            BotCommand("pixel", "Circumvent cryptographic obfuscation (Pixeldrain bypass karein)")
+            BotCommand("broadcast", "🗞 Broadcast Message"),
+            BotCommand("botstats", "🔎 Check User Stats"),
+            BotCommand("status", "🦥 Check System Status"),
+            BotCommand("log", "📄 Fetch Bot Logs"),
+            BotCommand("pixel", "✨ Bypass Pixeldrain Links")
         ]
 
         await app.set_bot_commands(public_commands, scope=BotCommandScopeDefault())
