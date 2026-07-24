@@ -180,14 +180,17 @@ class Database:
         count = await self.col.count_documents({"session": {"$ne": None}})
         return count
 
-    # --- RESUME PROGRESS METHODS ---
+    # --- RESUME PROGRESS METHODS (FIXED) ---
     async def save_sync_progress(self, user_id, source_id, dest_id, msg_id):
-        query = {"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)}
-        await self.db.sync_progress.update_one(
-            query,
-            {"$set": {"last_msg_id": int(msg_id), "updated_at": datetime.datetime.now()}},
-            upsert=True
-        )
+        current = await self.get_sync_progress(user_id, source_id, dest_id)
+        # 🧠 FIX: Ensure we never downgrade the progress if a smaller ID is processed later
+        if int(msg_id) > current:
+            query = {"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)}
+            await self.db.sync_progress.update_one(
+                query,
+                {"$set": {"last_msg_id": int(msg_id), "updated_at": datetime.datetime.now()}},
+                upsert=True
+            )
 
     async def get_sync_progress(self, user_id, source_id, dest_id):
         data = await self.db.sync_progress.find_one({"user_id": int(user_id), "source_id": str(source_id), "dest_id": str(dest_id)})
@@ -430,10 +433,8 @@ def generate_bar(percent: float, length: int = 12) -> str:
 def sanitize_filename(filename: str) -> str:
     if not filename: return "unnamed_file"
     filename = re.sub(r'[:]', "-", filename)
-    # FIX: DO NOT remove brackets here! Allowed characters updated.
     filename = re.sub(r'[\\/*?"<>|]', "", filename)
     name, ext = os.path.splitext(filename)
-    # FIX: Increased slice limit to 150 characters so long titles are not truncated!
     if len(name) > 150:
         name = name[:150]
     if not ext:
@@ -2316,30 +2317,42 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 is_temp_client = True
                 
             # If 'all' was passed, we can now fetch the exact toID
+            is_all_sync = False
             if range_match and range_match.group(2).lower() == "all":
+                is_all_sync = True
                 try:
                     async for last_msg in acc.get_chat_history(chatid_check, limit=1):
                         toID = last_msg.id
                 except Exception as e:
                     print(f"Failed to fetch last message for ALL: {e}")
+            elif str(text).lower().endswith("all"):
+                is_all_sync = True
+                try:
+                    async for last_msg in acc.get_chat_history(chatid_check, limit=1):
+                        toID = last_msg.id
+                except Exception as e:
+                    pass
             
             # --- RESUME LOGIC ADDED ---
             primary_dest = targets[0]['dest_id'] if targets else "unknown_dest"
             saved_msg_id = await db.get_sync_progress(user_id, chatid_check, primary_dest)
 
-            if saved_msg_id >= toID:
-                skip_msg = (f"⏭ **DUPLICATE SKIPPED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n✅ **Status:** Files up to ID `{toID}` are already synced.")
-                try: await client.send_message(message.chat.id, skip_msg, reply_to_message_id=message.id)
-                except: pass
-                if task_uuid in ACTIVE_PROCESSES.get(user_id, {}): del ACTIVE_PROCESSES[user_id][task_uuid]
-                if is_temp_client: await acc.stop()
-                return
-                
-            elif saved_msg_id >= fromID and saved_msg_id < toID:
-                fromID = saved_msg_id + 1
-                resume_msg = (f"♻️ **AUTO-RESUME ACTIVATED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n▶️ **Resuming From ID:** `{fromID}`")
-                try: await client.send_message(message.chat.id, resume_msg, reply_to_message_id=message.id)
-                except: pass
+            # 🧠 FIX: ONLY auto-resume if user wants to sync from the beginning (fromID == 1).
+            # If they input a custom start like "50-all" or "50-100", strictly obey their input and bypass resume!
+            if fromID == 1 and saved_msg_id > 0:
+                if saved_msg_id >= toID:
+                    skip_msg = (f"⏭ **DUPLICATE SKIPPED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n✅ **Status:** Files up to ID `{toID}` are already synced.\n\n*(Tip: If a file failed previously, type a manual range like `{max(1, toID-30)}-all` to force copy!)*")
+                    try: await client.send_message(message.chat.id, skip_msg, reply_to_message_id=message.id)
+                    except: pass
+                    if task_uuid in ACTIVE_PROCESSES.get(user_id, {}): del ACTIVE_PROCESSES[user_id][task_uuid]
+                    if is_temp_client: await acc.stop()
+                    return
+                    
+                elif saved_msg_id >= fromID and saved_msg_id < toID:
+                    fromID = saved_msg_id + 1
+                    resume_msg = (f"♻️ **AUTO-RESUME ACTIVATED!**\n🤖 **Bot/User:** {user_mention}\n📂 **Source ID:** `{chatid_check}`\n🎯 **Destination:** `{dest_title}`\n▶️ **Resuming From ID:** `{fromID}`\n\n*(Tip: To bypass resume and start exactly where you want, type a manual range like `2-all`)*")
+                    try: await client.send_message(message.chat.id, resume_msg, reply_to_message_id=message.id)
+                    except: pass
             # --------------------------
 
             total_count = max(1, toID - fromID + 1)
@@ -2419,7 +2432,9 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 if is_success: success_count += 1
                 else: failed_count += 1
 
-                if not was_cancelled: 
+                # 🧠 FIX: Only save progress if the file was SUCCESSFULLY forwarded/uploaded!
+                # This prevents failed/empty files from falsely corrupting the resume progress.
+                if is_success and not was_cancelled: 
                     await db.save_sync_progress(user_id, chatid_check, primary_dest, msgid)
 
                 # --- 3. UNIVERSAL SMART SLEEP ---
@@ -2954,7 +2969,7 @@ async def process_watcher_message(client, message):
             return 
 
         try:
-            # Always notify the User so they aren't left in the dark
+            # Always notify the User so they arent left in the dark
             dummy_status = await app.send_message(owner_id, f"⬇️ **Watcher:** Processing ID `{message.id}` (Download Mode)...")
             
             if LOG_CHANNEL:
