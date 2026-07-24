@@ -76,7 +76,7 @@ ADMINS = [int(x) for x in admin_str.split(",") if x.strip().isdigit()]
 sudo_str = os.environ.get("SUDOS", "")
 SUDOS = [int(x) for x in sudo_str.split(",") if x.strip().isdigit()]
 
-HELP_TXT = """<b>📚 BOT'S USAGE GUIDE</b>
+HELP_TXT = """<b>📚 LUCIFER BOT'S USAGE GUIDE</b>
 
 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬✘▬
 <blockquote expandable>
@@ -298,6 +298,7 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=50,                 
     sleep_threshold=20,
+    # max_concurrent_transmissions=10, 
     ipv6=False                    
 )
 
@@ -443,16 +444,12 @@ def sanitize_filename(filename: str) -> str:
 # ==============================================================================
 def smart_rename(filename, caption_text=""):
     filename_str = str(filename or "Unknown_File.mkv")
-    caption_str = str(caption_text or "")
     
     name_raw = urllib.parse.unquote(filename_str)
     base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)$', name_raw, re.IGNORECASE)
     base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
     
     clean_name = re.sub(r'\.\w{3,4}$', '', name_raw) 
-    
-    # Optional: If you want caption text appended, you can uncomment the next line
-    # clean_name = f"{clean_name} {caption_str}"
     
     # 1. Replace dots and underscores with spaces
     clean_name = clean_name.replace('.', ' ').replace('_', ' ')
@@ -482,7 +479,7 @@ def smart_rename(filename, caption_text=""):
 
     perfect_caption = clean_name
     
-    # HTML Escape Fix for safety
+    # HTML Escape Fix for safety (Pyrogram parser fix)
     perfect_caption_html = perfect_caption.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     
     perfect_filename = clean_name + base_ext
@@ -777,7 +774,7 @@ def get_message_type(msg: Message):
     return None
 
 # ==============================================================================
-# --- 💾 SAVED CHANNELS & SYNC MENU ---
+# --- SAVED CHANNELS & SYNC MENU ---
 # ==============================================================================
 
 @app.on_message(filters.command(["addsrc"]) & filters.private)
@@ -791,7 +788,6 @@ async def addsrc_cmd(client, message):
         ch_id = parts[1]
         name = parts[2]
         
-        # Validation Check: Ensure it's a valid ID or Username format
         if not (ch_id.startswith("-100") or ch_id.startswith("@") or ch_id.isdigit()):
             return await message.reply("❌ Invalid format. Must start with '-100' or '@'.\nExample: `/addsrc -100123456789 MyChannel`", reply_markup=close_btn)
             
@@ -1644,7 +1640,7 @@ async def unwatch_callback(client, query):
 # --- CORE: receive links / start tasks / processing / cancel checks ---
 # ==============================================================================
 
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "watch", "unwatch", "watchers", "removetarget", "removesource", "log", "addsrc", "adddst", "delch", "channels", "sync"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in PENDING_TASKS:
@@ -2248,7 +2244,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             if len(parts) >= 3 and parts[1].isdigit(): 
                 filter_thread_id = int(parts[1])
 
-            # Parse range safely (Fixed Unbound Bug)
+            # Parse range safely (Handling 'all')
             last_segment = parts[-1].strip()
             range_match = re.search(r"(\d+)\s*-\s*([a-zA-Z0-9]+)", text)
             
@@ -2294,7 +2290,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 await acc.start()
                 is_temp_client = True
                 
-            # If 'all' was passed, fetch the latest msg ID
+            # If 'all' was passed, we can now fetch the exact toID
             if range_match and range_match.group(2).lower() == "all":
                 try:
                     async for last_msg in acc.get_chat_history(chatid_check, limit=1):
@@ -2302,7 +2298,7 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                 except Exception as e:
                     print(f"Failed to fetch last message for ALL: {e}")
             
-            # --- RESUME LOGIC ---
+            # --- RESUME LOGIC ADDED ---
             primary_dest = targets[0]['dest_id'] if targets else "unknown_dest"
             saved_msg_id = await db.get_sync_progress(user_id, chatid_check, primary_dest)
 
@@ -2462,9 +2458,9 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
             time_taken_str = get_readable_time(int(duration))
             
             if 'was_cancelled' in locals() and was_cancelled:
-                header = f"Batch was Cancelled! 🛑 {user_mention} ✨"
+                header = f"Batch was Cancelled! 🛑 LUCIFER BOT ✨\n👤 {user_mention}"
             else:
-                header = f"Batch was Completed! ✅ {user_mention} ✨"
+                header = f"Batch was Completed! ✅ LUCIFER BOT ✨\n👤 {user_mention}"
 
             if total_count > 0:
                 final_text = (
@@ -2476,10 +2472,9 @@ async def process_links_logic(client: Client, message: Message, text: str, targe
                     f"├ ✅ **Successful:** `{success_count}`\n"
                     f"└ ❌ **Failed/Skipped:** `{failed_count}`"
                 )
-                
                 try: await client.send_message(message.chat.id, final_text, reply_to_message_id=message.id)
                 except: pass
-            
+                
             try: await status_message.delete()
             except: pass
 
@@ -2529,18 +2524,36 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
     elif msg_type == "Voice": original_filename = f"{msgid}.ogg"
 
     perfect_caption, perfect_filename = smart_rename(original_filename, msg.caption.html if msg.caption else "")
-    clean_caption = f"<b>{perfect_caption}</b>"
+    
+    # Text is NOT bolded, purely normal text as requested, with HTML escaping fixed
+    clean_caption = perfect_caption
 
     # 1. FAST FORWARD (Copy to Multiple Targets)
     if not is_restricted and not getattr(msg, "has_protected_content", False) and not getattr(msg.chat, "has_protected_content", False):
         forward_success = False
+        last_error = "" # TRACKING WHY FAST-COPY FAILS
+        
         for dest in targets:
             dest_chat_id = dest['dest_id']
+            # TYPE CAST FIX: Convert String ID to Int ID!
+            try: dest_chat_id = int(dest_chat_id)
+            except Exception: pass
+            
             dest_thread_id = dest.get('dest_thread')
+            try: 
+                if dest_thread_id: dest_thread_id = int(dest_thread_id)
+            except Exception: pass
+            
+            # WAKE UP CACHE TO PREVENT PeerIdInvalid
+            try:
+                await acc.get_chat(dest_chat_id)
+            except:
+                pass 
+                
             try:
                 await client.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                 forward_success = True
-            except Exception:
+            except Exception as e1:
                 try:
                     await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     forward_success = True
@@ -2549,15 +2562,32 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                     await asyncio.sleep(e.value + 2)
                     await acc.copy_message(chat_id=dest_chat_id, from_chat_id=chatid, message_id=msgid, reply_to_message_id=dest_thread_id, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     forward_success = True
-                except Exception as e:
-                    print(f"Task Fast-Copy blocked: {e}")
-        if forward_success: return True
-        # NOTE: 'return False' removed so it can drop down to download mode
+                except Exception as e2:
+                    last_error = str(e2)
+                    print(f"Task Fast-Copy blocked: {e2}")
+        
+        if forward_success: 
+            return True
+        else:
+            # LIVE ERROR LOG FOR USER
+            try:
+                await status_message.edit_text(f"⚠️ **Fast-Copy Failed!**\n`{last_error}`\n\n*Falling back to Slow Download... Please ensure User Account is Admin in Destination!*")
+                await asyncio.sleep(3)
+            except: pass
 
     if "Text" == msg_type:
         for dest in targets:
+            dest_chat_id = dest['dest_id']
+            try: dest_chat_id = int(dest_chat_id)
+            except Exception: pass
+            
+            dest_thread_id = dest.get('dest_thread')
+            try: 
+                if dest_thread_id: dest_thread_id = int(dest_thread_id)
+            except Exception: pass
+            
             text_content = msg.text.html if msg.text else ""
-            try: await client.send_message(dest['dest_id'], text_content, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True, reply_to_message_id=dest.get('dest_thread'))
+            try: await client.send_message(dest_chat_id, text_content, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True, reply_to_message_id=dest_thread_id)
             except: pass
         return True
 
@@ -2608,7 +2638,14 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                                 if task_uuid and CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED")
                                 for dest in targets:
                                     dest_chat_id = dest['dest_id']
+                                    try: dest_chat_id = int(dest_chat_id)
+                                    except Exception: pass
+                                    
                                     dest_thread_id = dest.get('dest_thread')
+                                    try: 
+                                        if dest_thread_id: dest_thread_id = int(dest_thread_id)
+                                    except Exception: pass
+                                    
                                     retry_part = 0
                                     while retry_part < 5: # Fight through network blips!
                                         try:
@@ -2675,7 +2712,14 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
         
         async def upload_to_dest(dest):
             dest_chat_id = dest['dest_id']
+            try: dest_chat_id = int(dest_chat_id)
+            except Exception: pass
+            
             dest_thread_id = dest.get('dest_thread')
+            try: 
+                if dest_thread_id: dest_thread_id = int(dest_thread_id)
+            except Exception: pass
+            
             success_local = False
             async with SERVER_UPLOAD_LIMIT:
                 async with USER_SEMAPHORES[user_id]:
@@ -2811,16 +2855,33 @@ async def process_watcher_message(client, message):
             # Use username if available so the Bot can access public channels it hasn't joined
             safe_source_id = message.chat.username if message.chat.username else chat_id
             
+            original_filename = "unknown_file"
+            if message.document and message.document.file_name: original_filename = message.document.file_name
+            elif message.video and message.video.file_name: original_filename = message.video.file_name
+            
+            caption_text = message.caption if message.caption else ""
+            perfect_caption, _ = smart_rename(original_filename, caption_text)
+            
+            # HTML ESCAPE FIX IN WATCHER TOO
+            perfect_caption_html = perfect_caption.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            clean_caption = perfect_caption_html
+
             for t in targets:
                 success = False
                 dest_id = t['dest_id']
+                try: dest_id = int(dest_id)
+                except Exception: pass
+                
                 dest_thread = t.get('dest_thread')
+                try: 
+                    if dest_thread: dest_thread = int(dest_thread)
+                except Exception: pass
                 
                 print(f"🚀 [DEBUG WATCHER] MODE A: Attempting Fast-Copy to {dest_id}")
                 
                 try: 
                     # OPTION 1: Try Bot First 
-                    await app.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread)
+                    await app.copy_message(chat_id=dest_id, from_chat_id=safe_source_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                     success = True
                     print("✅ [DEBUG WATCHER] Bot Fast-Copy SUCCESS!")
                 except Exception as e1: 
@@ -2833,7 +2894,7 @@ async def process_watcher_message(client, message):
 
                     try: 
                         # OPTION 2: Try User Fallback (Copy)
-                        await client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread)
+                        await client.copy_message(chat_id=dest_id, from_chat_id=chat_id, message_id=message.id, reply_to_message_id=dest_thread, caption=clean_caption, parse_mode=enums.ParseMode.HTML)
                         success = True
                         print("✅ [DEBUG WATCHER] Userbot Copy SUCCESS!")
                     except Exception as e2:
