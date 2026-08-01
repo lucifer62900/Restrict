@@ -417,49 +417,54 @@ def smart_rename(filename, caption_text=""):
     cap_str = str(caption_text or "")
     cap_str = re.sub(r'<[^>]+>', '', cap_str) 
     
-    # Extension ko temporary hatate hain clean karne ke liye
+    # Extension nikal lo original file name se
+    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', fname_str, re.IGNORECASE)
+    base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
+    
     clean_name = re.sub(r'\.\w{3,4}$', '', fname_str)
     
-    # FIX 1: Agar filename sirf numbers/hyphens hai (jaise 188-207) ya bahut chhota hai, toh Caption check karo
-    if len(clean_name) <= 5 or re.fullmatch(r'[\d\-\s]+', clean_name):
-        if cap_str:
-            for line in cap_str.split('\n'):
-                # Caption ki pehli theek-thaak line ko utha lo
-                if len(line.strip()) > 5:
-                    clean_name = line.strip()
-                    break
-                    
-    # Extension wapas hatao agar caption se extract hua hai toh
+    # 🧠 NAYA FIX: Caption ki pehli theek-thaak line extract karo
+    cap_first_line = ""
+    if cap_str:
+        for line in cap_str.split('\n'):
+            line = line.strip()
+            if len(line) > 5:
+                cap_first_line = line
+                break
+                
+    # 🧠 DECISION MAKER: Kya Caption me Asli Naam Chhipa Hai?
+    if cap_first_line:
+        # Agar caption ki pehli line me quality tags ya extension hai, toh wahi asli naam hai!
+        has_tags = re.search(r'(1080p|720p|480p|2160p|HEVC|WEB-DL|BluRay|x264|x265|\.mkv|\.mp4|\.avi)', cap_first_line, re.IGNORECASE)
+        is_fname_junk = len(clean_name) <= 5 or re.fullmatch(r'[\d\-\s_]+', clean_name)
+        
+        if has_tags or is_fname_junk:
+            clean_name = cap_first_line
+            
+    # Agar caption se naam uthaya hai toh uska bhi extension temporary hata do
     clean_name = re.sub(r'\.\w{3,4}$', '', clean_name)
     
-    # FIX 2: Underscores aur Dots ko sabse pehle hatayein taaki @username pure text ko na nigal jaye
-    clean_name = clean_name.replace('.', ' ').replace('_', ' ')
-    
-    # FIX 3: STRICT LOGIC - SIRF AUR SIRF SHURU KA KACHRA HATEGA (Middle tags safe rahenge)
+    # 🧠 STRICT LOGIC - SIRF AUR SIRF SHURU KA KACHRA HATEGA (Middle tags safe rahenge)
     while True:
         old_name = clean_name
         # Shuruwaat ka bracket tag [xyz] ya (xyz)
-        clean_name = re.sub(r'^[-~\s]*\[.*?\][-~\s]*', '', clean_name)
+        clean_name = re.sub(r'^[-~\s_]*\[.*?\][-~\s_]*', '', clean_name)
         # Shuruwaat ka @username
-        clean_name = re.sub(r'^[-~\s]*@[a-zA-Z0-9_]+[-~\s]*', '', clean_name)
+        clean_name = re.sub(r'^[-~\s_]*@[a-zA-Z0-9_]+[-~\s_]*', '', clean_name)
         # Shuruwaat ka URL
-        clean_name = re.sub(r'^[-~\s]*(?:https?:)?//\S+[-~\s]*', '', clean_name)
-        clean_name = re.sub(r'^[-~\s]*\bwww\.\S+[-~\s]*', '', clean_name)
+        clean_name = re.sub(r'^[-~\s_]*(?:https?:)?//\S+[-~\s_]*', '', clean_name)
+        clean_name = re.sub(r'^[-~\s_]*\bwww\.\S+[-~\s_]*', '', clean_name)
         
         # Agar aur koi junk nahi bacha leading me, toh loop tod do
         if old_name == clean_name:
             break
 
-    # Double spaces ko single space me badalna
+    # Double spaces ko single space me badalna (underscores safe rahenge)
     clean_name = re.sub(r'\s+', ' ', clean_name).strip(' -')
     
     if len(clean_name) <= 2:
         clean_name = "Unknown Title"
 
-    # Asli Extension wapas lagana
-    base_ext_match = re.search(r'\.(mkv|mp4|avi|webm|zip|rar|pdf)', fname_str, re.IGNORECASE)
-    base_ext = base_ext_match.group(0) if base_ext_match else ".mkv"
-    
     perfect_caption = clean_name
     perfect_filename = perfect_caption + base_ext
 
